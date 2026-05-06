@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 from datetime import datetime
 import os
@@ -8,6 +8,8 @@ import json
 
 app = FastAPI()
 
+# PoC only: temporary local app storage.
+# Files may disappear after app restart/redeploy.
 OUTPUT_DIR = "/tmp/agent_reports"
 
 
@@ -34,7 +36,8 @@ def save_markdown_file(filename: str, content: str):
     return {
         "status": "success",
         "path": path,
-        "message": f"Markdown report saved to {path}"
+        "storage_note": "PoC only: file is saved in temporary local app storage, not Unity Catalog Volume.",
+        "message": f"Markdown report saved to {path}",
     }
 
 
@@ -51,7 +54,7 @@ async def invocations(request: Request):
         raw_body = await request.body()
         payload = {
             "filename": "raw_agent_payload",
-            "content": raw_body.decode("utf-8", errors="replace")
+            "content": raw_body.decode("utf-8", errors="replace"),
         }
 
     filename = (
@@ -86,5 +89,27 @@ async def invocations(request: Request):
 
     return StreamingResponse(
         event_stream(),
-        media_type="text/event-stream"
+        media_type="text/event-stream",
+    )
+
+
+@app.get("/files")
+def list_files():
+    if not os.path.exists(OUTPUT_DIR):
+        return {"files": []}
+
+    return {"files": os.listdir(OUTPUT_DIR)}
+
+
+@app.get("/download/{filename}")
+def download_file(filename: str):
+    file_path = os.path.join(OUTPUT_DIR, filename)
+
+    if not os.path.exists(file_path):
+        return {"error": "File not found"}
+
+    return FileResponse(
+        path=file_path,
+        filename=filename,
+        media_type="text/markdown",
     )
