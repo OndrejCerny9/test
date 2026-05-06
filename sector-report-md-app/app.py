@@ -6,7 +6,7 @@ import re
 
 app = FastAPI()
 
-OUTPUT_DIR = "/Volumes/main/default/agent_reports"
+OUTPUT_DIR = "/Volumes/agentbricks/test/agent_reports"
 
 
 class MarkdownRequest(BaseModel):
