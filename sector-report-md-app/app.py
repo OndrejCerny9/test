@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from datetime import datetime
 import os
@@ -7,7 +8,6 @@ import json
 
 app = FastAPI()
 
-# For PoC only. Local app storage; file may disappear after app restart.
 OUTPUT_DIR = "/tmp/agent_reports"
 
 
@@ -26,7 +26,6 @@ def save_markdown_file(filename: str, content: str):
 
     safe_filename = re.sub(r"[^a-zA-Z0-9_-]", "_", filename or "agent_report")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
     path = f"{OUTPUT_DIR}/{safe_filename}_{timestamp}.md"
 
     with open(path, "w", encoding="utf-8") as f:
@@ -34,7 +33,8 @@ def save_markdown_file(filename: str, content: str):
 
     return {
         "status": "success",
-        "path": path
+        "path": path,
+        "message": f"Markdown report saved to {path}"
     }
 
 
@@ -79,4 +79,12 @@ async def invocations(request: Request):
     if not isinstance(content, str):
         content = json.dumps(content, indent=2, ensure_ascii=False)
 
-    return save_markdown_file(filename, content)
+    result = save_markdown_file(filename, content)
+
+    async def event_stream():
+        yield f"data: {json.dumps(result, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream"
+    )
