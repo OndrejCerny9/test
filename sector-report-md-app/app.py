@@ -7,7 +7,8 @@ import json
 
 app = FastAPI()
 
-OUTPUT_DIR = "/Volumes/agentbricks/test/agent_reports"
+# For PoC only. Local app storage; file may disappear after app restart.
+OUTPUT_DIR = "/tmp/agent_reports"
 
 
 class MarkdownRequest(BaseModel):
@@ -25,6 +26,7 @@ def save_markdown_file(filename: str, content: str):
 
     safe_filename = re.sub(r"[^a-zA-Z0-9_-]", "_", filename or "agent_report")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     path = f"{OUTPUT_DIR}/{safe_filename}_{timestamp}.md"
 
     with open(path, "w", encoding="utf-8") as f:
@@ -43,9 +45,15 @@ def save_markdown(request: MarkdownRequest):
 
 @app.post("/invocations")
 async def invocations(request: Request):
-    payload = await request.json()
+    try:
+        payload = await request.json()
+    except Exception:
+        raw_body = await request.body()
+        payload = {
+            "filename": "raw_agent_payload",
+            "content": raw_body.decode("utf-8", errors="replace")
+        }
 
-    # Agent Bricks may send different payload shapes.
     filename = (
         payload.get("filename")
         or payload.get("name")
@@ -61,9 +69,12 @@ async def invocations(request: Request):
         or payload.get("input")
     )
 
-    # If content is still not a string, serialize full payload for debugging.
     if content is None:
-        content = "# Debug Payload\n\n```json\n" + json.dumps(payload, indent=2, ensure_ascii=False) + "\n```"
+        content = (
+            "# Debug Payload\n\n```json\n"
+            + json.dumps(payload, indent=2, ensure_ascii=False)
+            + "\n```"
+        )
 
     if not isinstance(content, str):
         content = json.dumps(content, indent=2, ensure_ascii=False)
