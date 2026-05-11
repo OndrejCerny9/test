@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from datetime import datetime
 from databricks.sdk import WorkspaceClient
@@ -80,10 +81,7 @@ async def invocations(request: Request):
         raw_body = await request.body()
         payload = {
             "filename": "raw_agent_payload",
-            "content": raw_body.decode(
-                "utf-8",
-                errors="replace",
-            ),
+            "content": raw_body.decode("utf-8", errors="replace"),
         }
 
     filename = (
@@ -104,32 +102,29 @@ async def invocations(request: Request):
     if content is None:
         content = (
             "# Debug Payload\n\n```json\n"
-            + json.dumps(
-                payload,
-                indent=2,
-                ensure_ascii=False,
-            )
+            + json.dumps(payload, indent=2, ensure_ascii=False)
             + "\n```"
         )
 
     if not isinstance(content, str):
-        content = json.dumps(
-            content,
-            indent=2,
-            ensure_ascii=False,
-        )
+        content = json.dumps(content, indent=2, ensure_ascii=False)
 
-    result = save_markdown_file(
-        filename,
-        content,
-    )
+    result = save_markdown_file(filename, content)
 
-    return {
+    response_payload = {
         "success": True,
         "status": "success",
         "message": "Markdown report was successfully saved to the Unity Catalog Volume.",
         "result": result,
     }
+
+    async def event_stream():
+        yield f"data: {json.dumps(response_payload, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+    )
 
 
 @app.get("/files")
