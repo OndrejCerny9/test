@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 from datetime import datetime
 from databricks.sdk import WorkspaceClient
@@ -8,8 +8,14 @@ import json
 
 app = FastAPI()
 
-# Unity Catalog Volume
-VOLUME_PATH = "/Volumes/agentbricks/volumes/agent_reports"
+# Unity Catalog Volumes
+REPORT_VOLUME_PATH = "/Volumes/agentbricks/volumes/agent_reports"
+PICTURE_VOLUME_PATH = "/Volumes/agentbricks/volumes/pictures"
+
+# Your Databricks App URL
+APP_BASE_URL = (
+    "https://agent-md-conversion-app-3863256616093854.14.azure.databricksapps.com"
+)
 
 # Databricks Workspace client using app identity
 w = WorkspaceClient()
@@ -26,20 +32,25 @@ def root():
         "success": True,
         "status": "running",
         "message": "Markdown conversion app is running.",
-        "volume_path": VOLUME_PATH,
+        "report_volume_path": REPORT_VOLUME_PATH,
+        "picture_volume_path": PICTURE_VOLUME_PATH,
     }
 
 
-def save_markdown_file(filename: str, content: str):
-    safe_filename = re.sub(
+def sanitize_filename(filename: str) -> str:
+    return re.sub(
         r"[^a-zA-Z0-9_-]",
         "_",
         filename or "agent_report",
     )
 
+
+def save_markdown_file(filename: str, content: str):
+    safe_filename = sanitize_filename(filename)
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_filename = f"{safe_filename}_{timestamp}.md"
-    path = f"{VOLUME_PATH}/{output_filename}"
+    path = f"{REPORT_VOLUME_PATH}/{output_filename}"
 
     w.files.upload(
         file_path=path,
@@ -131,13 +142,13 @@ async def invocations(request: Request):
 def list_files():
     try:
         files = w.files.list_directory_contents(
-            directory_path=VOLUME_PATH,
+            directory_path=REPORT_VOLUME_PATH,
         )
 
         return {
             "success": True,
             "status": "success",
-            "volume_path": VOLUME_PATH,
+            "report_volume_path": REPORT_VOLUME_PATH,
             "files": [
                 {
                     "path": file_info.path,
@@ -153,7 +164,86 @@ def list_files():
             "status": "failed",
             "error_type": type(e).__name__,
             "error_message": str(e),
-            "volume_path": VOLUME_PATH,
+            "report_volume_path": REPORT_VOLUME_PATH,
+        }
+
+
+@app.get("/picture-metadata")
+def picture_metadata():
+    try:
+        files = w.files.list_directory_contents(
+            directory_path=PICTURE_VOLUME_PATH,
+        )
+
+        metadata_files = [
+            file_info
+            for file_info in files.contents
+            if file_info.name.endswith(".json")
+        ]
+
+        metadata = []
+
+        for file_info in metadata_files:
+            downloaded = w.files.download(file_path=file_info.path)
+            raw_content = downloaded.contents.read().decode("utf-8")
+            item = json.loads(raw_content)
+
+            image_filename = item.get("chart_filename")
+
+            if image_filename:
+                item["image_url"] = f"{APP_BASE_URL}/image/{image_filename}"
+                item["markdown_reference"] = (
+                    f"![{item.get('chart_title', image_filename)}]"
+                    f"({APP_BASE_URL}/image/{image_filename})"
+                )
+
+            metadata.append(item)
+
+        return {
+            "success": True,
+            "status": "success",
+            "picture_volume_path": PICTURE_VOLUME_PATH,
+            "metadata": metadata,
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "status": "failed",
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "picture_volume_path": PICTURE_VOLUME_PATH,
+        }
+
+
+@app.get("/image/{filename}")
+def get_image(filename: str):
+    try:
+        safe_filename = filename.split("/")[-1]
+        image_path = f"{PICTURE_VOLUME_PATH}/{safe_filename}"
+
+        downloaded = w.files.download(file_path=image_path)
+        image_bytes = downloaded.contents.read()
+
+        if safe_filename.lower().endswith(".png"):
+            media_type = "image/png"
+        elif safe_filename.lower().endswith(".jpg") or safe_filename.lower().endswith(".jpeg"):
+            media_type = "image/jpeg"
+        else:
+            media_type = "application/octet-stream"
+
+        return Response(
+            content=image_bytes,
+            media_type=media_type,
+        )
+
+    except Exception as e:
+        return {
+            "success": False,
+            "status": "failed",
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "filename": filename,
         }
 
 
@@ -183,5 +273,10 @@ def test_volume_write():
             "status": "failed",
             "error_type": type(e).__name__,
             "error_message": str(e),
-            "volume_path": VOLUME_PATH,
+            "report_volume_path": REPORT_VOLUME_PATH,
         }
+
+
+@app.get("/test-picture-metadata")
+def test_picture_metadata():
+    return picture_metadata()
