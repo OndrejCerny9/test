@@ -135,51 +135,48 @@ def save_markdown(request: MarkdownRequest):
 async def invocations(request: Request):
     try:
         payload = await request.json()
+
     except Exception:
         raw_body = await request.body()
+
         payload = {
+            "operation": "save_markdown",
             "filename": "raw_agent_payload",
-            "content": raw_body.decode("utf-8", errors="replace"),
+            "content": raw_body.decode(
+                "utf-8",
+                errors="replace",
+            ),
         }
 
-    payload_text = json.dumps(payload, ensure_ascii=False).lower()
+    operation = payload.get("operation")
 
-    wants_picture_metadata = any(
-        phrase in payload_text
-        for phrase in [
-            "picture metadata",
-            "chart metadata",
-            "available picture",
-            "available chart",
-            "visualization metadata",
-            "what charts",
-            "what pictures",
-            "list pictures",
-            "list charts",
-            "/picture-metadata",
-            "picture-metadata",
-        ]
-    )
+    # ---------------------------------------------------
+    # GET PICTURE METADATA
+    # ---------------------------------------------------
 
-    if wants_picture_metadata:
+    if operation == "get_picture_metadata":
+
         try:
             response_payload = get_picture_metadata_payload()
+
         except Exception as e:
+
             response_payload = {
                 "success": False,
                 "status": "failed",
                 "operation": "picture_metadata",
                 "error_type": type(e).__name__,
                 "error_message": str(e),
-                "picture_volume_path": PICTURE_VOLUME_PATH,
             }
 
         return sse_response(response_payload)
 
+    # ---------------------------------------------------
+    # SAVE MARKDOWN
+    # ---------------------------------------------------
+
     filename = (
         payload.get("filename")
-        or payload.get("name")
-        or payload.get("report_name")
         or "agent_report"
     )
 
@@ -187,39 +184,34 @@ async def invocations(request: Request):
         payload.get("content")
         or payload.get("markdown")
         or payload.get("report")
-        or payload.get("text")
-        or payload.get("input")
+        or ""
     )
 
-    if content is None:
-        content = (
-            "# Debug Payload\n\n```json\n"
-            + json.dumps(payload, indent=2, ensure_ascii=False)
-            + "\n```"
-        )
-
-    if not isinstance(content, str):
-        content = json.dumps(content, indent=2, ensure_ascii=False)
-
     try:
-        result = save_markdown_file(filename, content)
+
+        result = save_markdown_file(
+            filename,
+            content,
+        )
 
         response_payload = {
             "success": True,
             "status": "success",
             "operation": "save_markdown",
-            "message": "Markdown report was successfully saved to the Unity Catalog Volume.",
+            "message": (
+                "Markdown report successfully saved."
+            ),
             "result": result,
         }
 
     except Exception as e:
+
         response_payload = {
             "success": False,
             "status": "failed",
             "operation": "save_markdown",
             "error_type": type(e).__name__,
             "error_message": str(e),
-            "report_volume_path": REPORT_VOLUME_PATH,
         }
 
     return sse_response(response_payload)
