@@ -1,5 +1,4 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from datetime import datetime
 from databricks.sdk import WorkspaceClient
@@ -11,7 +10,7 @@ app = FastAPI()
 # Unity Catalog Volume
 VOLUME_PATH = "/Volumes/agentbricks/volumes/agent_reports"
 
-# Databricks Workspace client
+# Databricks Workspace client using app identity
 w = WorkspaceClient()
 
 
@@ -23,7 +22,9 @@ class MarkdownRequest(BaseModel):
 @app.get("/")
 def root():
     return {
+        "success": True,
         "status": "running",
+        "message": "Markdown conversion app is running.",
         "volume_path": VOLUME_PATH,
     }
 
@@ -36,9 +37,7 @@ def save_markdown_file(filename: str, content: str):
     )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
     output_filename = f"{safe_filename}_{timestamp}.md"
-
     path = f"{VOLUME_PATH}/{output_filename}"
 
     w.files.upload(
@@ -48,20 +47,28 @@ def save_markdown_file(filename: str, content: str):
     )
 
     return {
+        "success": True,
         "status": "success",
         "filename": output_filename,
         "path": path,
         "volume": "agentbricks.volumes.agent_reports",
-        "message": f"Markdown report saved to {path}",
+        "message": f"Markdown report successfully saved to {path}",
     }
 
 
 @app.post("/save-markdown")
 def save_markdown(request: MarkdownRequest):
-    return save_markdown_file(
+    result = save_markdown_file(
         request.filename,
         request.content,
     )
+
+    return {
+        "success": True,
+        "status": "success",
+        "message": "Markdown report was successfully saved to the Unity Catalog Volume.",
+        "result": result,
+    }
 
 
 @app.post("/invocations")
@@ -71,7 +78,6 @@ async def invocations(request: Request):
 
     except Exception:
         raw_body = await request.body()
-
         payload = {
             "filename": "raw_agent_payload",
             "content": raw_body.decode(
@@ -118,16 +124,12 @@ async def invocations(request: Request):
         content,
     )
 
-    async def event_stream():
-        yield (
-            f"data: "
-            f"{json.dumps(result, ensure_ascii=False)}\n\n"
-        )
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-    )
+    return {
+        "success": True,
+        "status": "success",
+        "message": "Markdown report was successfully saved to the Unity Catalog Volume.",
+        "result": result,
+    }
 
 
 @app.get("/files")
@@ -138,22 +140,25 @@ def list_files():
         )
 
         return {
+            "success": True,
             "status": "success",
             "volume_path": VOLUME_PATH,
             "files": [
                 {
-                    "path": f.path,
-                    "name": f.name,
+                    "path": file_info.path,
+                    "name": file_info.name,
                 }
-                for f in files.contents
+                for file_info in files.contents
             ],
         }
 
     except Exception as e:
         return {
+            "success": False,
             "status": "failed",
             "error_type": type(e).__name__,
             "error_message": str(e),
+            "volume_path": VOLUME_PATH,
         }
 
 
@@ -171,13 +176,16 @@ def test_volume_write():
         )
 
         return {
-            "test_status": "success",
+            "success": True,
+            "status": "success",
+            "message": "Volume write test completed successfully.",
             "result": result,
         }
 
     except Exception as e:
         return {
-            "test_status": "failed",
+            "success": False,
+            "status": "failed",
             "error_type": type(e).__name__,
             "error_message": str(e),
             "volume_path": VOLUME_PATH,
