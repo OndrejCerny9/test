@@ -29,8 +29,6 @@ def root():
 
 
 def save_markdown_file(filename: str, content: str):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
     safe_filename = re.sub(
         r"[^a-zA-Z0-9_-]",
         "_",
@@ -38,13 +36,8 @@ def save_markdown_file(filename: str, content: str):
     )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
     output_filename = f"{safe_filename}_{timestamp}.md"
-
-    path = os.path.join(
-        OUTPUT_DIR,
-        output_filename,
-    )
+    path = os.path.join(OUTPUT_DIR, output_filename)
 
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
@@ -135,7 +128,12 @@ async def invocations(request: Request):
 
 @app.get("/files")
 def list_files():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    if not os.path.exists(OUTPUT_DIR):
+        return {
+            "storage": OUTPUT_DIR,
+            "error": "Output directory does not exist or app has no access.",
+            "files": [],
+        }
 
     files = []
 
@@ -178,3 +176,18 @@ def download_file(filename: str):
         filename=safe_filename,
         media_type="text/markdown",
     )
+
+
+@app.get("/test-volume-write")
+def test_volume_write():
+    test_content = "# Volume Write Test\n\nThis file was created by the Databricks App."
+
+    result = save_markdown_file(
+        filename="test_volume_write",
+        content=test_content,
+    )
+
+    return {
+        "test_status": "success",
+        "result": result,
+    }
