@@ -1,18 +1,18 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from datetime import datetime
-import os
+from databricks.sdk import WorkspaceClient
 import re
 import json
 
 app = FastAPI()
 
-# Persistent Unity Catalog Volume storage
-# Catalog: agentbricks
-# Schema: volumes
-# Volume: agent_reports
-OUTPUT_DIR = "/Volumes/agentbricks/volumes/agent_reports"
+# Unity Catalog Volume
+VOLUME_PATH = "/Volumes/agentbricks/volumes/agent_reports"
+
+# Databricks Workspace client
+w = WorkspaceClient()
 
 
 class MarkdownRequest(BaseModel):
@@ -24,7 +24,7 @@ class MarkdownRequest(BaseModel):
 def root():
     return {
         "status": "running",
-        "storage": OUTPUT_DIR,
+        "volume_path": VOLUME_PATH,
     }
 
 
@@ -36,18 +36,22 @@ def save_markdown_file(filename: str, content: str):
     )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_filename = f"{safe_filename}_{timestamp}.md"
-    path = os.path.join(OUTPUT_DIR, output_filename)
 
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+    output_filename = f"{safe_filename}_{timestamp}.md"
+
+    path = f"{VOLUME_PATH}/{output_filename}"
+
+    w.files.upload(
+        file_path=path,
+        contents=content.encode("utf-8"),
+        overwrite=True,
+    )
 
     return {
         "status": "success",
         "filename": output_filename,
         "path": path,
         "volume": "agentbricks.volumes.agent_reports",
-        "download_endpoint": f"/download/{output_filename}",
         "message": f"Markdown report saved to {path}",
     }
 
@@ -128,66 +132,53 @@ async def invocations(request: Request):
 
 @app.get("/files")
 def list_files():
-    if not os.path.exists(OUTPUT_DIR):
-        return {
-            "storage": OUTPUT_DIR,
-            "error": "Output directory does not exist or app has no access.",
-            "files": [],
-        }
-
-    files = []
-
-    for filename in sorted(os.listdir(OUTPUT_DIR)):
-        files.append(
-            {
-                "filename": filename,
-                "download_endpoint": f"/download/{filename}",
-            }
+    try:
+        files = w.files.list_directory_contents(
+            directory_path=VOLUME_PATH,
         )
 
-    return {
-        "storage": OUTPUT_DIR,
-        "files": files,
-    }
-
-
-@app.get("/download/{filename}")
-def download_file(filename: str):
-    safe_filename = os.path.basename(filename)
-
-    file_path = os.path.join(
-        OUTPUT_DIR,
-        safe_filename,
-    )
-
-    if not os.path.exists(file_path):
         return {
-            "error": "File not found",
-            "requested_file": safe_filename,
-            "available_files": (
-                os.listdir(OUTPUT_DIR)
-                if os.path.exists(OUTPUT_DIR)
-                else []
-            ),
+            "status": "success",
+            "volume_path": VOLUME_PATH,
+            "files": [
+                {
+                    "path": f.path,
+                    "name": f.name,
+                }
+                for f in files.contents
+            ],
         }
 
-    return FileResponse(
-        path=file_path,
-        filename=safe_filename,
-        media_type="text/markdown",
-    )
+    except Exception as e:
+        return {
+            "status": "failed",
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+        }
 
 
 @app.get("/test-volume-write")
 def test_volume_write():
-    test_content = "# Volume Write Test\n\nThis file was created by the Databricks App."
+    try:
+        test_content = (
+            "# Volume Write Test\n\n"
+            "This file was created by the Databricks App."
+        )
 
-    result = save_markdown_file(
-        filename="test_volume_write",
-        content=test_content,
-    )
+        result = save_markdown_file(
+            filename="test_volume_write",
+            content=test_content,
+        )
 
-    return {
-        "test_status": "success",
-        "result": result,
-    }
+        return {
+            "test_status": "success",
+            "result": result,
+        }
+
+    except Exception as e:
+        return {
+            "test_status": "failed",
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "volume_path": VOLUME_PATH,
+        }
