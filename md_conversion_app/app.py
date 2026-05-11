@@ -8,16 +8,13 @@ import json
 
 app = FastAPI()
 
-# Unity Catalog Volumes
 REPORT_VOLUME_PATH = "/Volumes/agentbricks/volumes/agent_reports"
 PICTURE_VOLUME_PATH = "/Volumes/agentbricks/volumes/pictures"
 
-# Your Databricks App URL
 APP_BASE_URL = (
     "https://agent-md-conversion-app-3863256616093854.14.azure.databricksapps.com"
 )
 
-# Databricks Workspace client using app identity
 w = WorkspaceClient()
 
 
@@ -37,6 +34,16 @@ def root():
     }
 
 
+def sse_response(payload: dict):
+    async def event_stream():
+        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+    )
+
+
 def sanitize_filename(filename: str) -> str:
     return re.sub(
         r"[^a-zA-Z0-9_-]",
@@ -47,7 +54,6 @@ def sanitize_filename(filename: str) -> str:
 
 def save_markdown_file(filename: str, content: str):
     safe_filename = sanitize_filename(filename)
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_filename = f"{safe_filename}_{timestamp}.md"
     path = f"{REPORT_VOLUME_PATH}/{output_filename}"
@@ -68,6 +74,47 @@ def save_markdown_file(filename: str, content: str):
     }
 
 
+def get_picture_metadata_payload():
+    files = list(
+        w.files.list_directory_contents(
+            directory_path=PICTURE_VOLUME_PATH,
+        )
+    )
+
+    metadata_files = [
+        file_info
+        for file_info in files
+        if file_info.name.endswith(".json")
+    ]
+
+    metadata = []
+
+    for file_info in metadata_files:
+        downloaded = w.files.download(file_path=file_info.path)
+        raw_content = downloaded.contents.read().decode("utf-8")
+        item = json.loads(raw_content)
+
+        image_filename = item.get("chart_filename")
+
+        if image_filename:
+            item["image_url"] = f"{APP_BASE_URL}/image/{image_filename}"
+            item["markdown_reference"] = (
+                f"![{item.get('chart_title', image_filename)}]"
+                f"({APP_BASE_URL}/image/{image_filename})"
+            )
+
+        metadata.append(item)
+
+    return {
+        "success": True,
+        "status": "success",
+        "operation": "picture_metadata",
+        "message": "Available picture metadata returned successfully.",
+        "picture_volume_path": PICTURE_VOLUME_PATH,
+        "metadata": metadata,
+    }
+
+
 @app.post("/save-markdown")
 def save_markdown(request: MarkdownRequest):
     result = save_markdown_file(
@@ -78,6 +125,7 @@ def save_markdown(request: MarkdownRequest):
     return {
         "success": True,
         "status": "success",
+        "operation": "save_markdown",
         "message": "Markdown report was successfully saved to the Unity Catalog Volume.",
         "result": result,
     }
@@ -87,13 +135,46 @@ def save_markdown(request: MarkdownRequest):
 async def invocations(request: Request):
     try:
         payload = await request.json()
-
     except Exception:
         raw_body = await request.body()
         payload = {
             "filename": "raw_agent_payload",
             "content": raw_body.decode("utf-8", errors="replace"),
         }
+
+    payload_text = json.dumps(payload, ensure_ascii=False).lower()
+
+    wants_picture_metadata = any(
+        phrase in payload_text
+        for phrase in [
+            "picture metadata",
+            "chart metadata",
+            "available picture",
+            "available chart",
+            "visualization metadata",
+            "what charts",
+            "what pictures",
+            "list pictures",
+            "list charts",
+            "/picture-metadata",
+            "picture-metadata",
+        ]
+    )
+
+    if wants_picture_metadata:
+        try:
+            response_payload = get_picture_metadata_payload()
+        except Exception as e:
+            response_payload = {
+                "success": False,
+                "status": "failed",
+                "operation": "picture_metadata",
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+                "picture_volume_path": PICTURE_VOLUME_PATH,
+            }
+
+        return sse_response(response_payload)
 
     filename = (
         payload.get("filename")
@@ -120,29 +201,37 @@ async def invocations(request: Request):
     if not isinstance(content, str):
         content = json.dumps(content, indent=2, ensure_ascii=False)
 
-    result = save_markdown_file(filename, content)
+    try:
+        result = save_markdown_file(filename, content)
 
-    response_payload = {
-        "success": True,
-        "status": "success",
-        "message": "Markdown report was successfully saved to the Unity Catalog Volume.",
-        "result": result,
-    }
+        response_payload = {
+            "success": True,
+            "status": "success",
+            "operation": "save_markdown",
+            "message": "Markdown report was successfully saved to the Unity Catalog Volume.",
+            "result": result,
+        }
 
-    async def event_stream():
-        yield f"data: {json.dumps(response_payload, ensure_ascii=False)}\n\n"
+    except Exception as e:
+        response_payload = {
+            "success": False,
+            "status": "failed",
+            "operation": "save_markdown",
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "report_volume_path": REPORT_VOLUME_PATH,
+        }
 
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-    )
+    return sse_response(response_payload)
 
 
 @app.get("/files")
 def list_files():
     try:
-        files = w.files.list_directory_contents(
-            directory_path=REPORT_VOLUME_PATH,
+        files = list(
+            w.files.list_directory_contents(
+                directory_path=REPORT_VOLUME_PATH,
+            )
         )
 
         return {
@@ -154,7 +243,7 @@ def list_files():
                     "path": file_info.path,
                     "name": file_info.name,
                 }
-                for file_info in files.contents
+                for file_info in files
             ],
         }
 
@@ -171,56 +260,13 @@ def list_files():
 @app.get("/picture-metadata")
 def picture_metadata():
     try:
-        files = list(
-            w.files.list_directory_contents(
-                directory_path=PICTURE_VOLUME_PATH,
-            )
-        )
-
-        metadata_files = [
-            file_info
-            for file_info in files
-            if file_info.name.endswith(".json")
-        ]
-
-        metadata = []
-
-        for file_info in metadata_files:
-            downloaded = w.files.download(
-                file_path=file_info.path
-            )
-
-            raw_content = (
-                downloaded.contents.read().decode("utf-8")
-            )
-
-            item = json.loads(raw_content)
-
-            image_filename = item.get("chart_filename")
-
-            if image_filename:
-                item["image_url"] = (
-                    f"{APP_BASE_URL}/image/{image_filename}"
-                )
-
-                item["markdown_reference"] = (
-                    f"![{item.get('chart_title', image_filename)}]"
-                    f"({APP_BASE_URL}/image/{image_filename})"
-                )
-
-            metadata.append(item)
-
-        return {
-            "success": True,
-            "status": "success",
-            "picture_volume_path": PICTURE_VOLUME_PATH,
-            "metadata": metadata,
-        }
+        return get_picture_metadata_payload()
 
     except Exception as e:
         return {
             "success": False,
             "status": "failed",
+            "operation": "picture_metadata",
             "error_type": type(e).__name__,
             "error_message": str(e),
             "picture_volume_path": PICTURE_VOLUME_PATH,
