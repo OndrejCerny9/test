@@ -171,27 +171,38 @@ def list_files():
 @app.get("/picture-metadata")
 def picture_metadata():
     try:
-        files = w.files.list_directory_contents(
-            directory_path=PICTURE_VOLUME_PATH,
+        files = list(
+            w.files.list_directory_contents(
+                directory_path=PICTURE_VOLUME_PATH,
+            )
         )
 
         metadata_files = [
             file_info
-            for file_info in files.contents
+            for file_info in files
             if file_info.name.endswith(".json")
         ]
 
         metadata = []
 
         for file_info in metadata_files:
-            downloaded = w.files.download(file_path=file_info.path)
-            raw_content = downloaded.contents.read().decode("utf-8")
+            downloaded = w.files.download(
+                file_path=file_info.path
+            )
+
+            raw_content = (
+                downloaded.contents.read().decode("utf-8")
+            )
+
             item = json.loads(raw_content)
 
             image_filename = item.get("chart_filename")
 
             if image_filename:
-                item["image_url"] = f"{APP_BASE_URL}/image/{image_filename}"
+                item["image_url"] = (
+                    f"{APP_BASE_URL}/image/{image_filename}"
+                )
+
                 item["markdown_reference"] = (
                     f"![{item.get('chart_title', image_filename)}]"
                     f"({APP_BASE_URL}/image/{image_filename})"
