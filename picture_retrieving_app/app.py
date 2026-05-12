@@ -8,7 +8,7 @@ app = FastAPI()
 PICTURE_VOLUME_PATH = "/Volumes/agentbricks/volumes/pictures"
 
 APP_BASE_URL = (
-    "https://agent-image-discovery-app-3863256616093854.14.azure.databricksapps.com"
+    "https://agent-picture-retrieving-app-3863256616093854.14.azure.databricksapps.com"
 )
 
 w = WorkspaceClient()
