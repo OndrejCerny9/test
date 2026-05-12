@@ -69,13 +69,43 @@ def save_markdown_file(filename: str, content: str):
     }
 
 
+def clean_markdown_content(content: str):
+    if not isinstance(content, str):
+        return None, content
+
+    patterns_with_filename = [
+        'Save the following markdown report as "',
+        'Save this markdown report with filename "',
+    ]
+
+    for pattern in patterns_with_filename:
+        if content.startswith(pattern):
+            try:
+                filename = content.split(pattern, 1)[1].split('"', 1)[0]
+                markdown_content = content.split(":\n\n", 1)[1]
+                return filename, markdown_content
+            except Exception:
+                return None, content
+
+    patterns_without_filename = [
+        "Save this automotive industry analysis report:",
+        "Save this markdown report:",
+        "Save the following markdown report:",
+    ]
+
+    for pattern in patterns_without_filename:
+        if content.startswith(pattern):
+            markdown_content = content.replace(pattern, "", 1).strip()
+            return None, markdown_content
+
+    return None, content
+
+
 def extract_markdown_payload(payload):
     if isinstance(payload, list) and len(payload) > 0:
         first_item = payload[0]
 
         if isinstance(first_item, dict):
-            content = first_item.get("content")
-
             filename = (
                 first_item.get("filename")
                 or first_item.get("name")
@@ -83,22 +113,14 @@ def extract_markdown_payload(payload):
                 or "agent_report"
             )
 
-            if content:
-                marker = 'Save the following markdown report as "'
-                if content.startswith(marker):
-                    try:
-                        filename_part = content.split(marker, 1)[1].split('"', 1)[0]
-                        report_content = content.split(":\n\n", 1)[1]
-                        return filename_part, report_content
-                    except Exception:
-                        return filename, content
+            content = first_item.get("content")
 
-                marker_alt = "Save this automotive industry analysis report:"
-                if content.startswith(marker_alt):
-                    report_content = content.replace(marker_alt, "", 1).strip()
-                    return filename, report_content
+            extracted_filename, cleaned_content = clean_markdown_content(content)
 
-                return filename, content
+            return (
+                extracted_filename or filename,
+                cleaned_content,
+            )
 
     if isinstance(payload, dict):
         filename = (
@@ -116,31 +138,23 @@ def extract_markdown_payload(payload):
             or payload.get("input")
         )
 
-        if content:
-            marker = 'Save the following markdown report as "'
-            if isinstance(content, str) and content.startswith(marker):
-                try:
-                    filename_part = content.split(marker, 1)[1].split('"', 1)[0]
-                    report_content = content.split(":\n\n", 1)[1]
-                    return filename_part, report_content
-                except Exception:
-                    return filename, content
+        extracted_filename, cleaned_content = clean_markdown_content(content)
 
-            marker_alt = "Save this automotive industry analysis report:"
-            if isinstance(content, str) and content.startswith(marker_alt):
-                report_content = content.replace(marker_alt, "", 1).strip()
-                return filename, report_content
-
-        return filename, content
+        return (
+            extracted_filename or filename,
+            cleaned_content,
+        )
 
     return "agent_report", str(payload)
 
 
 @app.post("/save-markdown")
 def save_markdown(request: MarkdownRequest):
+    extracted_filename, cleaned_content = clean_markdown_content(request.content)
+
     result = save_markdown_file(
-        request.filename,
-        request.content,
+        extracted_filename or request.filename,
+        cleaned_content,
     )
 
     return {
