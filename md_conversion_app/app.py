@@ -69,9 +69,33 @@ def save_markdown_file(filename: str, content: str):
     }
 
 
+def try_parse_json(value):
+    if not isinstance(value, str):
+        return value
+
+    stripped = value.strip()
+
+    if not (
+        stripped.startswith("{")
+        or stripped.startswith("[")
+    ):
+        return value
+
+    try:
+        return json.loads(stripped)
+    except Exception:
+        return value
+
+
 def clean_markdown_content(content: str):
     if not isinstance(content, str):
         return None, content
+
+    content = content.strip()
+
+    parsed = try_parse_json(content)
+    if parsed is not content:
+        return extract_markdown_payload(parsed)
 
     patterns_with_filename = [
         'Save the following markdown report as "',
@@ -91,6 +115,7 @@ def clean_markdown_content(content: str):
         "Save this automotive industry analysis report:",
         "Save this markdown report:",
         "Save the following markdown report:",
+        "Save this report:",
     ]
 
     for pattern in patterns_without_filename:
@@ -102,6 +127,8 @@ def clean_markdown_content(content: str):
 
 
 def extract_markdown_payload(payload):
+    payload = try_parse_json(payload)
+
     if isinstance(payload, list) and len(payload) > 0:
         first_item = payload[0]
 
@@ -113,7 +140,13 @@ def extract_markdown_payload(payload):
                 or "agent_report"
             )
 
-            content = first_item.get("content")
+            content = (
+                first_item.get("content")
+                or first_item.get("markdown")
+                or first_item.get("report")
+                or first_item.get("text")
+                or first_item.get("input")
+            )
 
             extracted_filename, cleaned_content = clean_markdown_content(content)
 
@@ -145,15 +178,31 @@ def extract_markdown_payload(payload):
             cleaned_content,
         )
 
+    if isinstance(payload, str):
+        extracted_filename, cleaned_content = clean_markdown_content(payload)
+        return extracted_filename or "agent_report", cleaned_content
+
     return "agent_report", str(payload)
 
 
 @app.post("/save-markdown")
 def save_markdown(request: MarkdownRequest):
-    extracted_filename, cleaned_content = clean_markdown_content(request.content)
+    filename, cleaned_content = extract_markdown_payload(
+        {
+            "filename": request.filename,
+            "content": request.content,
+        }
+    )
+
+    if not isinstance(cleaned_content, str):
+        cleaned_content = json.dumps(
+            cleaned_content,
+            indent=2,
+            ensure_ascii=False,
+        )
 
     result = save_markdown_file(
-        extracted_filename or request.filename,
+        filename,
         cleaned_content,
     )
 
@@ -170,14 +219,13 @@ def save_markdown(request: MarkdownRequest):
 
 @app.post("/invocations")
 async def invocations(request: Request):
+    raw_body = await request.body()
+    raw_text = raw_body.decode("utf-8", errors="replace")
+
     try:
-        payload = await request.json()
+        payload = json.loads(raw_text)
     except Exception:
-        raw_body = await request.body()
-        payload = {
-            "filename": "raw_agent_payload",
-            "content": raw_body.decode("utf-8", errors="replace"),
-        }
+        payload = raw_text
 
     filename, content = extract_markdown_payload(payload)
 
@@ -189,7 +237,11 @@ async def invocations(request: Request):
         )
 
     if not isinstance(content, str):
-        content = json.dumps(content, indent=2, ensure_ascii=False)
+        content = json.dumps(
+            content,
+            indent=2,
+            ensure_ascii=False,
+        )
 
     try:
         result = save_markdown_file(filename, content)
