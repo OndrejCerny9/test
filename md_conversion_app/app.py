@@ -69,6 +69,73 @@ def save_markdown_file(filename: str, content: str):
     }
 
 
+def extract_markdown_payload(payload):
+    if isinstance(payload, list) and len(payload) > 0:
+        first_item = payload[0]
+
+        if isinstance(first_item, dict):
+            content = first_item.get("content")
+
+            filename = (
+                first_item.get("filename")
+                or first_item.get("name")
+                or first_item.get("report_name")
+                or "agent_report"
+            )
+
+            if content:
+                marker = 'Save the following markdown report as "'
+                if content.startswith(marker):
+                    try:
+                        filename_part = content.split(marker, 1)[1].split('"', 1)[0]
+                        report_content = content.split(":\n\n", 1)[1]
+                        return filename_part, report_content
+                    except Exception:
+                        return filename, content
+
+                marker_alt = "Save this automotive industry analysis report:"
+                if content.startswith(marker_alt):
+                    report_content = content.replace(marker_alt, "", 1).strip()
+                    return filename, report_content
+
+                return filename, content
+
+    if isinstance(payload, dict):
+        filename = (
+            payload.get("filename")
+            or payload.get("name")
+            or payload.get("report_name")
+            or "agent_report"
+        )
+
+        content = (
+            payload.get("content")
+            or payload.get("markdown")
+            or payload.get("report")
+            or payload.get("text")
+            or payload.get("input")
+        )
+
+        if content:
+            marker = 'Save the following markdown report as "'
+            if isinstance(content, str) and content.startswith(marker):
+                try:
+                    filename_part = content.split(marker, 1)[1].split('"', 1)[0]
+                    report_content = content.split(":\n\n", 1)[1]
+                    return filename_part, report_content
+                except Exception:
+                    return filename, content
+
+            marker_alt = "Save this automotive industry analysis report:"
+            if isinstance(content, str) and content.startswith(marker_alt):
+                report_content = content.replace(marker_alt, "", 1).strip()
+                return filename, report_content
+
+        return filename, content
+
+    return "agent_report", str(payload)
+
+
 @app.post("/save-markdown")
 def save_markdown(request: MarkdownRequest):
     result = save_markdown_file(
@@ -98,20 +165,7 @@ async def invocations(request: Request):
             "content": raw_body.decode("utf-8", errors="replace"),
         }
 
-    filename = (
-        payload.get("filename")
-        or payload.get("name")
-        or payload.get("report_name")
-        or "agent_report"
-    )
-
-    content = (
-        payload.get("content")
-        or payload.get("markdown")
-        or payload.get("report")
-        or payload.get("text")
-        or payload.get("input")
-    )
+    filename, content = extract_markdown_payload(payload)
 
     if content is None:
         content = (
