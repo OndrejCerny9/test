@@ -3,7 +3,7 @@ Sector Report Agent - FastAPI Application
 
 A Databricks App that acts as a sub-agent for the Supervisor Agent.
 It receives chat messages via /invocations, extracts HTML content and filename,
-converts to Word (.docx), and returns the result as an Anthropic-style SSE stream.
+converts to Word (.docx), and returns the result as an SSE stream.
 """
 
 import os
@@ -138,31 +138,6 @@ def _extract_params_from_message(content: str) -> tuple:
     return None, None
 
 
-def _generate_sse_response(response_text: str):
-    """
-    Generate an Anthropic-style SSE stream that the Supervisor Agent expects.
-    """
-    msg_id = f"msg_{uuid.uuid4().hex[:12]}"
-
-    # event: message_start
-    yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': 'sector-report-agent', 'stop_reason': None}})}\n\n"
-
-    # event: content_block_start
-    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-
-    # event: content_block_delta - the actual response text
-    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': response_text}})}\n\n"
-
-    # event: content_block_stop
-    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-
-    # event: message_delta
-    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'output_tokens': len(response_text.split())}})}\n\n"
-
-    # event: message_stop
-    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
-
-
 CAPABILITIES_RESPONSE = (
     "I am the Sector Report converter. I convert HTML reports (including Chart.js charts) "
     "to Word documents (.docx). Send me a JSON message with 'filename' (ending in .docx) "
@@ -193,6 +168,7 @@ async def invocations_endpoint(request: Request):
 
     Receives chat messages, extracts filename + html_content,
     performs conversion, and returns an Anthropic-style SSE stream.
+    The stream starts immediately to keep the connection alive.
     """
     body = await request.json()
     logger.info(f"Received /invocations request body keys: {list(body.keys())}")
@@ -210,29 +186,50 @@ async def invocations_endpoint(request: Request):
 
     logger.info(f"Last message content (first 300 chars): {last_content[:300]}")
 
-    # Extract parameters and perform conversion
+    # Extract parameters
     filename, html_content = _extract_params_from_message(last_content)
 
-    if filename and html_content:
-        try:
-            result = _do_conversion(filename, html_content)
-            response_text = (
-                f"Report converted and saved successfully. "
-                f"File: {result['filename']}. "
-                f"Path: {result['path']}. "
-                f"Status: {result['status']}"
-            )
-        except HTTPException as e:
-            response_text = f"Error converting report: {e.detail}"
-        except Exception as e:
-            response_text = f"Error converting report: {str(e)}"
-    else:
-        response_text = CAPABILITIES_RESPONSE
-        logger.info("No filename/html_content found in message, returning capabilities")
+    def generate_stream():
+        """
+        Generator that starts streaming SSE immediately,
+        performs the conversion, then streams the result.
+        """
+        msg_id = f"msg_{uuid.uuid4().hex[:12]}"
 
-    # Always return as SSE stream (Supervisor Agent always expects streaming)
+        # Start message immediately to keep connection alive
+        yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': 'sector-report-agent', 'stop_reason': None}})}\n\n"
+
+        # Start content block
+        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+
+        # Now do the actual work
+        if filename and html_content:
+            try:
+                result = _do_conversion(filename, html_content)
+                response_text = (
+                    f"Report converted and saved successfully. "
+                    f"File: {result['filename']}. "
+                    f"Path: {result['path']}. "
+                    f"Status: {result['status']}"
+                )
+            except Exception as e:
+                response_text = f"Error converting report: {str(e)}"
+        else:
+            response_text = CAPABILITIES_RESPONSE
+
+        # Stream the content
+        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': response_text}})}\n\n"
+
+        # End content block
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+
+        # End message
+        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'output_tokens': len(response_text.split())}})}\n\n"
+
+        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+
     return StreamingResponse(
-        _generate_sse_response(response_text),
+        generate_stream(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
