@@ -1,16 +1,6 @@
 # Databricks Apps configuration for Sector Report Agent
-# This app renders HTML reports (including Chart.js charts) in a headless browser,
-# converts them to Word documents (.docx), and saves them to a Unity Catalog Volume.
-#
-# NETWORK EGRESS REQUIREMENTS:
-# If your workspace uses Private Link with restricted egress, add these domains
-# to your network policy allowlist:
-#
-#   cdn.jsdelivr.net          - Chart.js CDN (loaded by headless browser at runtime)
-#   playwright.azureedge.net  - Playwright browser download (needed at startup)
-#   *.blob.core.windows.net   - Azure storage (for UC Volumes access)
-#
-# If your workspace has unrestricted egress (default), no action needed.
+# This app parses Chart.js configurations from HTML, renders charts with matplotlib,
+# converts the result to Word documents (.docx), and saves to a Unity Catalog Volume.
 
 command:
   - "bash"
