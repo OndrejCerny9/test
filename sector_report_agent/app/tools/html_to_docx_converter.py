@@ -38,7 +38,10 @@ async def _render_html_with_playwright(html_content: str) -> str:
     and return the modified HTML with charts as inline images.
     """
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+        )
         page = await browser.new_page(viewport={"width": 1200, "height": 800})
 
         # Load the HTML content
