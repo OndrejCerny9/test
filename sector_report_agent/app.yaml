@@ -1,1 +1,15 @@
-command: ["uvicorn", "app.serving_app:app", "--host", "0.0.0.0", "--port", "8000"]
+# Databricks Apps configuration for Sector Report Agent
+# This app exposes an HTTP tool endpoint for a Supervisor Agent
+# to save generated HTML reports into a Unity Catalog Volume.
+
+command:
+  - "uvicorn"
+  - "app.main:app"
+  - "--host"
+  - "0.0.0.0"
+  - "--port"
+  - "8000"
+
+env:
+  - name: REPORT_VOLUME_PATH
+    value: "/Volumes/agentbricks/test/agent_reports"

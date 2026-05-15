@@ -1,48 +1,96 @@
 # Sector Report Agent
 
-Architecture:
+A Databricks App that exposes an HTTP tool endpoint for a Databricks Supervisor Agent.  
+The Supervisor Agent generates HTML reports with charts, and this app saves the generated HTML files into a Unity Catalog Volume.
 
-Supervisor Agent
-- Genie Space: `sector_analysis_genie_space`
-- Agent Endpoint: `Sector Report Generator`
+## Purpose
 
-The Genie Space performs analytical work over:
+This application serves as a **tool endpoint** for a Supervisor Agent workflow:
 
-`agentbricks.sector_data_bronze`
+1. The Supervisor Agent orchestrates report generation (data retrieval, chart creation, HTML assembly).
+2. Once the HTML report is ready, the agent calls this app's `/save-html-report` endpoint.
+3. The app persists the HTML file to a Unity Catalog Volume for downstream access.
 
-The Agent Endpoint creates:
-- Word reports
-- PNG charts
-- report state records
+## Endpoints
 
-Output path:
+### `GET /health`
 
-`/Volumes/agentbricks/test/agent_reports`
+Health check endpoint.
 
-## Setup
+**Response:**
+```json
+{
+  "status": "healthy",
+  "service": "sector-report-agent"
+}
+```
 
-Run:
+### `POST /save-html-report`
 
-`notebooks/01_setup.sql`
+Saves an HTML report to the configured Unity Catalog Volume.
 
-Install requirements:
+**Request Body:**
+```json
+{
+  "filename": "automotive_sector_report.html",
+  "html_content": "<html><head><title>Report</title></head><body><h1>Automotive Sector</h1></body></html>"
+}
+```
 
-`pip install -r requirements.txt`
+**Response (success):**
+```json
+{
+  "status": "success",
+  "path": "/Volumes/agentbricks/test/agent_reports/automotive_sector_report.html",
+  "filename": "automotive_sector_report.html"
+}
+```
 
-Run local app:
+**Response (error):**
+```json
+{
+  "detail": "Failed to write report to /Volumes/..."
+}
+```
 
-`uvicorn app.serving_app:app --host 0.0.0.0 --port 8000`
+## Where Files Are Saved
 
-## Supervisor Agent setup
+Reports are saved to the Unity Catalog Volume at:
 
-Add sub-agent 1:
+```
+/Volumes/agentbricks/test/agent_reports/
+```
 
-Type: Genie Space  
-Source: sector_analysis_genie_space  
-Agent Name: sector_analyst  
+This path is configurable via the `REPORT_VOLUME_PATH` environment variable.
 
-Add sub-agent 2:
+## Testing
 
-Type: Agent Endpoint  
-Source: deployed report generator endpoint  
-Agent Name: report_generator  
+### Test Health Endpoint
+
+```bash
+curl -X GET http://localhost:8000/health
+```
+
+### Test Save Report Endpoint
+
+```bash
+curl -X POST http://localhost:8000/save-html-report \
+  -H "Content-Type: application/json" \
+  -d '{
+    "filename": "test_report.html",
+    "html_content": "<html><body><h1>Test</h1></body></html>"
+  }'
+```
+
+## Local Development
+
+```bash
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+## Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REPORT_VOLUME_PATH` | `/Volumes/agentbricks/test/agent_reports` | Target volume path for saved reports |
