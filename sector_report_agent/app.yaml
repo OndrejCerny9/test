@@ -11,9 +11,6 @@
 #   *.blob.core.windows.net   - Azure storage (for UC Volumes access)
 #
 # If your workspace has unrestricted egress (default), no action needed.
-# To check for denied connections:
-#   SELECT * FROM system.access.outbound_network
-#   WHERE event_time >= CURRENT_TIMESTAMP() - INTERVAL 2 HOUR;
 
 command:
   - "bash"
@@ -21,4 +18,4 @@ command:
 
 env:
   - name: REPORT_VOLUME_PATH
-    value: "/Volumes/agentbricks/test/agent_reports"
+    value: "/Volumes/agentbricks/volumes/agent_reports"

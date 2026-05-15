@@ -9,23 +9,22 @@ Flow:
 2. Convert <canvas> elements to inline <img> base64 PNGs
 3. Strip scripts and extract the rendered body content
 4. Convert the cleaned HTML to DOCX using htmldocx
-5. Save the .docx file to the configured UC Volume
+5. Save the .docx file to the configured UC Volume via Databricks SDK
 """
 
 import os
 import io
-import base64
 import logging
-import asyncio
 from bs4 import BeautifulSoup
 from docx import Document
-from docx.shared import Inches
 from htmldocx import HtmlToDocx
 from playwright.async_api import async_playwright
+from databricks.sdk import WorkspaceClient
+import asyncio
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_VOLUME_PATH = "/Volumes/agentbricks/test/agent_reports"
+DEFAULT_VOLUME_PATH = "/Volumes/agentbricks/volumes/agent_reports"
 
 
 def get_volume_path() -> str:
@@ -61,7 +60,6 @@ async def _render_html_with_playwright(html_content: str) -> str:
                         img.style.maxWidth = '100%';
                         img.style.display = 'block';
                         img.style.margin = '10px auto';
-                        // Replace the canvas (or its container) with the image
                         if (canvas.parentElement && canvas.parentElement.classList.contains('chart-container')) {
                             canvas.parentElement.replaceChild(img, canvas);
                         } else {
@@ -75,7 +73,6 @@ async def _render_html_with_playwright(html_content: str) -> str:
                 // Remove all script tags
                 document.querySelectorAll('script').forEach(s => s.remove());
 
-                // Return the body innerHTML
                 return document.body.innerHTML;
             }
         """)
@@ -94,17 +91,11 @@ def _html_has_scripts(html_content: str) -> bool:
 def _build_docx_from_html(rendered_html: str) -> Document:
     """
     Build a DOCX document from rendered HTML.
-
-    Handles base64 images from chart rendering and converts text/tables
-    via htmldocx.
+    Handles base64 images from chart rendering and converts text/tables via htmldocx.
     """
     soup = BeautifulSoup(rendered_html, "html.parser")
     doc = Document()
 
-    # Extract base64 images and track their positions
-    # htmldocx handles <img src="data:image/..."> tags natively
-    # We just need to ensure the HTML is clean
-    
     # Remove style tags (styling is handled by docx formatting)
     for style_tag in soup.find_all("style"):
         style_tag.decompose()
@@ -117,6 +108,33 @@ def _build_docx_from_html(rendered_html: str) -> Document:
     parser.add_html_to_document(clean_html, doc)
 
     return doc
+
+
+def _save_to_volume(doc: Document, volume_path: str, filename: str) -> str:
+    """
+    Save a DOCX document to a Unity Catalog Volume using the Databricks SDK.
+
+    Args:
+        doc: The python-docx Document object.
+        volume_path: The UC Volume path (e.g., /Volumes/catalog/schema/volume).
+        filename: The filename to save as.
+
+    Returns:
+        The full path where the file was saved.
+    """
+    # Serialize DOCX to bytes in memory
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+
+    # Build the full path
+    full_path = f"{volume_path}/{filename}"
+
+    # Upload via Databricks SDK Files API
+    w = WorkspaceClient()
+    w.files.upload(full_path, buffer, overwrite=True)
+
+    return full_path
 
 
 def convert_html_to_docx(filename: str, html_content: str) -> dict:
@@ -136,13 +154,7 @@ def convert_html_to_docx(filename: str, html_content: str) -> dict:
         ValueError: If HTML conversion fails.
     """
     volume_path = get_volume_path()
-
-    # Ensure the output directory exists
-    os.makedirs(volume_path, exist_ok=True)
-    logger.info(f"Volume path verified: {volume_path}")
-
-    # Build full file path
-    full_path = os.path.join(volume_path, filename)
+    logger.info(f"Target volume path: {volume_path}")
 
     try:
         # If HTML has scripts (Chart.js, etc.), render with Playwright first
@@ -158,7 +170,6 @@ def convert_html_to_docx(filename: str, html_content: str) -> dict:
                 loop.close()
         else:
             logger.info("HTML is static - converting directly")
-            # For static HTML, extract body content
             soup = BeautifulSoup(html_content, "html.parser")
             body = soup.find("body")
             rendered_html = str(body) if body else html_content
@@ -170,13 +181,13 @@ def convert_html_to_docx(filename: str, html_content: str) -> dict:
         logger.error(f"HTML to DOCX conversion failed: {e}")
         raise ValueError(f"HTML to DOCX conversion failed: {e}") from e
 
-    # Save the DOCX file
+    # Save the DOCX to the UC Volume via SDK
     try:
-        doc.save(full_path)
+        full_path = _save_to_volume(doc, volume_path, filename)
         logger.info(f"DOCX report saved successfully: {full_path}")
-    except OSError as e:
-        logger.error(f"Failed to write report to {full_path}: {e}")
-        raise OSError(f"Failed to write report to {full_path}: {e}") from e
+    except Exception as e:
+        logger.error(f"Failed to write report to volume: {e}")
+        raise OSError(f"Failed to write report to {volume_path}/{filename}: {e}") from e
 
     return {
         "status": "success",
