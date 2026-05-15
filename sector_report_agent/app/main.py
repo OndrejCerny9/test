@@ -3,7 +3,7 @@ Sector Report Agent - FastAPI Application
 
 A Databricks App that acts as a sub-agent for the Supervisor Agent.
 It receives chat messages via /invocations, extracts HTML content and filename,
-converts to Word (.docx), and returns the result as a chat response.
+converts to Word (.docx), and returns the result as a streaming SSE response.
 """
 
 import os
@@ -11,7 +11,7 @@ import re
 import json
 import logging
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, field_validator
 
 from app.tools.html_to_docx_converter import convert_html_to_docx
@@ -81,11 +81,6 @@ def _do_conversion(filename: str, html_content: str) -> dict:
 def _extract_params_from_message(content: str) -> tuple:
     """
     Try to extract filename and html_content from a message.
-    
-    Supports:
-    - Pure JSON: {"filename": "...", "html_content": "..."}
-    - JSON embedded in text (between ```json ... ``` or just {...})
-    - Structured text with clear filename and HTML sections
     """
     # Try 1: Direct JSON parse
     try:
@@ -95,11 +90,10 @@ def _extract_params_from_message(content: str) -> tuple:
     except (json.JSONDecodeError, TypeError):
         pass
 
-    # Try 2: Find JSON block in the text (```json ... ``` or naked JSON)
+    # Try 2: Find JSON block in the text
     json_patterns = [
-        r'```json\s*\n?(\{.*?\})\s*\n?```',  # ```json {...} ```
-        r'```\s*\n?(\{.*?\})\s*\n?```',       # ``` {...} ```
-        r'(\{[^{}]*"filename"[^{}]*"html_content"[^{}]*\})',  # inline JSON with our keys
+        r'```json\s*\n?(\{.*?\})\s*\n?```',
+        r'```\s*\n?(\{.*?\})\s*\n?```',
     ]
     for pattern in json_patterns:
         match = re.search(pattern, content, re.DOTALL)
@@ -111,34 +105,61 @@ def _extract_params_from_message(content: str) -> tuple:
             except (json.JSONDecodeError, TypeError):
                 continue
 
-    # Try 3: Look for filename and HTML content separately in the text
+    # Try 3: Find JSON object with our keys anywhere in the content
+    # Use a greedy approach to find the largest JSON-like structure
+    try:
+        # Find the start of a JSON object containing filename
+        idx = content.find('"filename"')
+        if idx == -1:
+            idx = content.find("'filename'")
+        if idx > -1:
+            # Walk back to find the opening brace
+            brace_start = content.rfind('{', 0, idx)
+            if brace_start > -1:
+                # Walk forward to find the matching closing brace
+                brace_count = 0
+                for i in range(brace_start, len(content)):
+                    if content[i] == '{':
+                        brace_count += 1
+                    elif content[i] == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            json_str = content[brace_start:i+1]
+                            data = json.loads(json_str)
+                            if "filename" in data and "html_content" in data:
+                                return data["filename"], data["html_content"]
+                            break
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+    # Try 4: Look for filename and HTML content separately
     filename_match = re.search(r'filename["\':\s]+([\w\-]+\.docx)', content)
-    
-    # Look for HTML content (starts with <!DOCTYPE or <html)
     html_match = re.search(r'(<!DOCTYPE html>.*?</html>|<html[^>]*>.*?</html>)', content, re.DOTALL | re.IGNORECASE)
-    
+
     if filename_match and html_match:
         return filename_match.group(1), html_match.group(1)
 
-    # Try 4: If there's HTML content but no explicit filename, generate one
     if html_match:
         return "report.docx", html_match.group(1)
 
     return None, None
 
 
-CAPABILITIES_RESPONSE = """I am the Sector Report converter. I convert HTML reports (including Chart.js charts) to Word documents (.docx).
+def _make_sse_chunk(data: dict) -> str:
+    """Format a dict as an SSE data line."""
+    return f"data: {json.dumps(data)}\n\n"
 
-To use me, send a message containing:
-1. A filename ending in .docx (e.g., "automotive_sector_report.docx")
-2. The full HTML content of the report
 
-You can send these as JSON:
-{"filename": "report.docx", "html_content": "<!DOCTYPE html><html>...</html>"}
+def _make_done_chunk() -> str:
+    """Format the SSE done signal."""
+    return "data: [DONE]\n\n"
 
-Or include them naturally in your message - I will extract the HTML and filename automatically.
 
-I support: headings, paragraphs, tables, lists, bold/italic text, and Chart.js charts (bar, line, pie, doughnut)."""
+CAPABILITIES_RESPONSE = (
+    "I am the Sector Report converter. I convert HTML reports (including Chart.js charts) "
+    "to Word documents (.docx). Send me a JSON message with 'filename' (ending in .docx) "
+    "and 'html_content' (the full HTML string) and I will convert and save it."
+)
 
 
 # --- Endpoints ---
@@ -161,15 +182,14 @@ def convert_to_docx_endpoint(request: ConvertReportRequest):
 async def invocations_endpoint(request: Request):
     """
     Sub-agent endpoint called by the Databricks Supervisor Agent.
-    
-    Receives chat messages in format:
-    {"input": [{"role": "user", "content": "..."}], "context": {...}, "stream": bool}
-    
-    Extracts filename + html_content from the message content,
-    performs conversion, and returns a chat-style response.
+
+    Receives chat messages, extracts filename + html_content,
+    performs conversion, and returns an SSE streaming response.
     """
     body = await request.json()
     logger.info(f"Received /invocations request body keys: {list(body.keys())}")
+
+    stream = body.get("stream", False)
 
     # Extract the last message content from the conversation
     messages = body.get("input", [])
@@ -182,31 +202,67 @@ async def invocations_endpoint(request: Request):
             last_content = msg["content"]
             break
 
-    logger.info(f"Last message content (first 500 chars): {last_content[:500]}")
+    logger.info(f"Last message content (first 300 chars): {last_content[:300]}")
 
     # Try to extract parameters from the message
     filename, html_content = _extract_params_from_message(last_content)
 
     if filename and html_content:
-        # Perform conversion
         try:
             result = _do_conversion(filename, html_content)
             response_text = (
-                f"Report converted and saved successfully.\n"
-                f"- **File**: {result['filename']}\n"
-                f"- **Path**: {result['path']}\n"
-                f"- **Status**: {result['status']}"
+                f"Report converted and saved successfully. "
+                f"File: {result['filename']}. "
+                f"Path: {result['path']}. "
+                f"Status: {result['status']}"
             )
         except HTTPException as e:
             response_text = f"Error converting report: {e.detail}"
         except Exception as e:
             response_text = f"Error converting report: {str(e)}"
     else:
-        # No valid parameters found - return capabilities description
         response_text = CAPABILITIES_RESPONSE
         logger.info("No filename/html_content found in message, returning capabilities")
 
-    # Return in the agent response format
-    return {
-        "output": response_text
-    }
+    # Return response in the appropriate format
+    if stream:
+        # Return as Server-Sent Events stream (text/event-stream)
+        def generate_sse():
+            # Send the response as a single chunk in OpenAI-compatible format
+            chunk = {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "content": response_text,
+                        },
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+            yield _make_sse_chunk(chunk)
+            yield _make_done_chunk()
+
+        return StreamingResponse(
+            generate_sse(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+    else:
+        # Return as regular JSON
+        return {
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": response_text,
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        }
