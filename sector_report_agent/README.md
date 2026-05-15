@@ -1,31 +1,33 @@
 # Sector Report Agent
 
 A Databricks App that exposes an HTTP tool endpoint for a Databricks Supervisor Agent.  
-The Supervisor Agent generates HTML reports (including Chart.js visualizations), and this app renders them in a headless browser, converts them to Word documents (.docx), and saves the resulting files into a Unity Catalog Volume.
+The Supervisor Agent generates HTML reports with Chart.js visualizations, and this app extracts chart data, renders charts with matplotlib, converts everything to Word documents (.docx), and saves the files to a Unity Catalog Volume.
 
 ## Purpose
 
 This application serves as a **tool endpoint** for a Supervisor Agent workflow:
 
-1. The Supervisor Agent orchestrates report generation (data retrieval, chart creation, HTML assembly with Chart.js).
+1. The Supervisor Agent orchestrates report generation (data retrieval, analysis, HTML assembly with Chart.js).
 2. Once the HTML report is ready, the agent calls this app's `/convert-to-docx` endpoint.
-3. The app renders the HTML in headless Chromium (executing JavaScript to render charts).
-4. Canvas-based charts are converted to inline PNG images.
-5. The rendered HTML is converted to a Word document (.docx) and saved to a Unity Catalog Volume.
+3. The app parses Chart.js configurations from `<script>` blocks.
+4. Charts are rendered server-side as PNG images using matplotlib.
+5. Text and tables are converted via `htmldocx`, chart images are inserted via `python-docx`.
+6. The final .docx is saved to a Unity Catalog Volume using the Databricks SDK.
 
 ## How Chart Rendering Works
 
-The agent generates HTML with `<script>` tags for Chart.js (or similar JS charting libraries). The app:
+The agent generates HTML with Chart.js `<script>` blocks. Since there's no browser in the app container, charts are re-rendered with matplotlib:
 
-1. Detects `<script>` tags in the HTML
-2. Loads the HTML in headless Chromium via Playwright
-3. Waits for charts to render (JavaScript execution)
-4. Converts each `<canvas>` element to a base64 PNG image
-5. Replaces canvases with `<img>` tags in the DOM
-6. Extracts the rendered HTML (now with static images instead of JS charts)
-7. Converts the static HTML to DOCX using `htmldocx`
+1. Regex extracts `new Chart(...)` calls from `<script>` tags
+2. Parses: chart type, labels, data arrays, dataset labels, colors, title
+3. Renders equivalent chart with matplotlib → PNG bytes
+4. Replaces `<canvas>` elements with text placeholders in the HTML
+5. Converts cleaned HTML (text + tables) to DOCX via `htmldocx`
+6. Post-processes the DOCX: finds placeholder paragraphs and replaces them with chart images via `python-docx`'s `add_picture()`
 
-If the HTML has no scripts (pure static HTML), it skips Playwright and converts directly.
+Supported chart types: **bar**, **line**, **pie**, **doughnut** (with fallback to bar for unknown types).
+
+If the HTML contains no `<script>` tags (static HTML), it converts directly without chart processing.
 
 ## Endpoints
 
@@ -43,7 +45,7 @@ Health check endpoint.
 
 ### `POST /convert-to-docx`
 
-Renders HTML (including JS charts) and converts to a Word document (.docx).
+Converts HTML (including Chart.js) to a Word document (.docx) and saves it.
 
 **Request Body:**
 ```json
@@ -53,54 +55,78 @@ Renders HTML (including JS charts) and converts to a Word document (.docx).
 }
 ```
 
-**Response (success):**
+**Response (success - 200):**
 ```json
 {
   "status": "success",
-  "path": "/Volumes/agentbricks/test/agent_reports/automotive_sector_report.docx",
+  "path": "/Volumes/agentbricks/volumes/agent_reports/automotive_sector_report.docx",
   "filename": "automotive_sector_report.docx"
+}
+```
+
+**Response (conversion error - 422):**
+```json
+{
+  "detail": "HTML to DOCX conversion failed: [error details]"
+}
+```
+
+**Response (save error - 500):**
+```json
+{
+  "detail": "Failed to write report to /Volumes/..."
 }
 ```
 
 ## Where Files Are Saved
 
 ```
-/Volumes/agentbricks/test/agent_reports/
+/Volumes/agentbricks/volumes/agent_reports/
 ```
 
 Configurable via the `REPORT_VOLUME_PATH` environment variable.
-
-## Supported Chart Libraries
-
-Any JavaScript charting library that renders to `<canvas>`:
-
-- **Chart.js** (recommended - lightweight, CDN available)
-- **Plotly.js** (via CDN)
-- **D3.js** with canvas rendering
-- Any library loaded via CDN `<script>` tag
-
-## Testing
-
-```bash
-curl -X POST http://localhost:8000/convert-to-docx \
-  -H "Content-Type: application/json" \
-  -d '{
-    "filename": "test_chart_report.docx",
-    "html_content": "<!DOCTYPE html><html><head><script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script></head><body><canvas id=\"myChart\"></canvas><script>new Chart(document.getElementById(\'myChart\'), {type:\'bar\',data:{labels:[\'A\',\'B\'],datasets:[{data:[10,20]}]}});</script></body></html>"
-  }'
-```
 
 ## Local Development
 
 ```bash
 pip install -r requirements.txt
-playwright install chromium
-playwright install-deps chromium
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+## Testing
+
+```bash
+curl -X GET http://localhost:8000/health
+
+curl -X POST http://localhost:8000/convert-to-docx \
+  -H "Content-Type: application/json" \
+  -d '{
+    "filename": "test_report.docx",
+    "html_content": "<html><body><h1>Test</h1><p>Hello world</p></body></html>"
+  }'
 ```
 
 ## Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `REPORT_VOLUME_PATH` | `/Volumes/agentbricks/test/agent_reports` | Target volume path for saved reports |
+| `REPORT_VOLUME_PATH` | `/Volumes/agentbricks/volumes/agent_reports` | Target UC Volume path for saved reports |
+
+## Dependencies
+
+| Library | Purpose |
+|---------|---------|
+| fastapi | HTTP API framework |
+| python-docx | Word document creation and image embedding |
+| htmldocx | HTML text/table to DOCX conversion |
+| beautifulsoup4 | HTML parsing |
+| matplotlib | Server-side chart rendering |
+| numpy | Numerical arrays for chart data |
+| databricks-sdk | UC Volume file upload via Files API |
+
+## Permissions
+
+The app's service principal needs:
+- `USE CATALOG` on the target catalog
+- `USE SCHEMA` on the target schema
+- `READ VOLUME` + `WRITE VOLUME` on the target volume
