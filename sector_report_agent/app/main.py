@@ -3,13 +3,14 @@ Sector Report Agent - FastAPI Application
 
 A Databricks App that acts as a sub-agent for the Supervisor Agent.
 It receives chat messages via /invocations, extracts HTML content and filename,
-converts to Word (.docx), and returns the result as a streaming SSE response.
+converts to Word (.docx), and returns the result as an Anthropic-style SSE stream.
 """
 
 import os
 import re
 import json
 import logging
+import uuid
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, field_validator
@@ -39,7 +40,6 @@ class ConvertReportRequest(BaseModel):
     @field_validator("filename")
     @classmethod
     def validate_filename(cls, v: str) -> str:
-        """Validate that filename ends with .docx."""
         if not v.endswith(".docx"):
             raise ValueError("Filename must end with .docx")
         return v
@@ -79,9 +79,7 @@ def _do_conversion(filename: str, html_content: str) -> dict:
 
 
 def _extract_params_from_message(content: str) -> tuple:
-    """
-    Try to extract filename and html_content from a message.
-    """
+    """Try to extract filename and html_content from a message."""
     # Try 1: Direct JSON parse
     try:
         data = json.loads(content)
@@ -90,7 +88,7 @@ def _extract_params_from_message(content: str) -> tuple:
     except (json.JSONDecodeError, TypeError):
         pass
 
-    # Try 2: Find JSON block in the text
+    # Try 2: Find JSON block in code fences
     json_patterns = [
         r'```json\s*\n?(\{.*?\})\s*\n?```',
         r'```\s*\n?(\{.*?\})\s*\n?```',
@@ -105,18 +103,14 @@ def _extract_params_from_message(content: str) -> tuple:
             except (json.JSONDecodeError, TypeError):
                 continue
 
-    # Try 3: Find JSON object with our keys anywhere in the content
-    # Use a greedy approach to find the largest JSON-like structure
+    # Try 3: Find JSON with our keys using brace matching
     try:
-        # Find the start of a JSON object containing filename
         idx = content.find('"filename"')
         if idx == -1:
             idx = content.find("'filename'")
         if idx > -1:
-            # Walk back to find the opening brace
             brace_start = content.rfind('{', 0, idx)
             if brace_start > -1:
-                # Walk forward to find the matching closing brace
                 brace_count = 0
                 for i in range(brace_start, len(content)):
                     if content[i] == '{':
@@ -132,27 +126,41 @@ def _extract_params_from_message(content: str) -> tuple:
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
 
-    # Try 4: Look for filename and HTML content separately
+    # Try 4: Look for HTML content in the message
     filename_match = re.search(r'filename["\':\s]+([\w\-]+\.docx)', content)
     html_match = re.search(r'(<!DOCTYPE html>.*?</html>|<html[^>]*>.*?</html>)', content, re.DOTALL | re.IGNORECASE)
 
     if filename_match and html_match:
         return filename_match.group(1), html_match.group(1)
-
     if html_match:
         return "report.docx", html_match.group(1)
 
     return None, None
 
 
-def _make_sse_chunk(data: dict) -> str:
-    """Format a dict as an SSE data line."""
-    return f"data: {json.dumps(data)}\n\n"
+def _generate_sse_response(response_text: str):
+    """
+    Generate an Anthropic-style SSE stream that the Supervisor Agent expects.
+    """
+    msg_id = f"msg_{uuid.uuid4().hex[:12]}"
 
+    # event: message_start
+    yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': 'sector-report-agent', 'stop_reason': None}})}\n\n"
 
-def _make_done_chunk() -> str:
-    """Format the SSE done signal."""
-    return "data: [DONE]\n\n"
+    # event: content_block_start
+    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+
+    # event: content_block_delta - the actual response text
+    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': response_text}})}\n\n"
+
+    # event: content_block_stop
+    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+
+    # event: message_delta
+    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'output_tokens': len(response_text.split())}})}\n\n"
+
+    # event: message_stop
+    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
 
 
 CAPABILITIES_RESPONSE = (
@@ -184,14 +192,12 @@ async def invocations_endpoint(request: Request):
     Sub-agent endpoint called by the Databricks Supervisor Agent.
 
     Receives chat messages, extracts filename + html_content,
-    performs conversion, and returns an SSE streaming response.
+    performs conversion, and returns an Anthropic-style SSE stream.
     """
     body = await request.json()
     logger.info(f"Received /invocations request body keys: {list(body.keys())}")
 
-    stream = body.get("stream", False)
-
-    # Extract the last message content from the conversation
+    # Extract the last message content
     messages = body.get("input", [])
     if not messages:
         messages = body.get("messages", [])
@@ -204,7 +210,7 @@ async def invocations_endpoint(request: Request):
 
     logger.info(f"Last message content (first 300 chars): {last_content[:300]}")
 
-    # Try to extract parameters from the message
+    # Extract parameters and perform conversion
     filename, html_content = _extract_params_from_message(last_content)
 
     if filename and html_content:
@@ -224,45 +230,13 @@ async def invocations_endpoint(request: Request):
         response_text = CAPABILITIES_RESPONSE
         logger.info("No filename/html_content found in message, returning capabilities")
 
-    # Return response in the appropriate format
-    if stream:
-        # Return as Server-Sent Events stream (text/event-stream)
-        def generate_sse():
-            # Send the response as a single chunk in OpenAI-compatible format
-            chunk = {
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {
-                            "role": "assistant",
-                            "content": response_text,
-                        },
-                        "finish_reason": "stop",
-                    }
-                ]
-            }
-            yield _make_sse_chunk(chunk)
-            yield _make_done_chunk()
-
-        return StreamingResponse(
-            generate_sse(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-            },
-        )
-    else:
-        # Return as regular JSON
-        return {
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": response_text,
-                    },
-                    "finish_reason": "stop",
-                }
-            ]
-        }
+    # Always return as SSE stream (Supervisor Agent always expects streaming)
+    return StreamingResponse(
+        _generate_sse_response(response_text),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
