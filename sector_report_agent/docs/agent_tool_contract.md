@@ -2,11 +2,11 @@
 
 ## Tool Definition
 
-**Tool Name:** `save_html_report`
+**Tool Name:** `convert_html_to_docx`
 
-**Description:** Saves a generated HTML report file to the configured Unity Catalog Volume. Use this tool after assembling the final HTML report content.
+**Description:** Renders an HTML report (including JavaScript-based charts like Chart.js) in a headless browser, converts it to a Word document (.docx), and saves it to the configured Unity Catalog Volume. Use this tool after assembling the final HTML report content with charts.
 
-**Endpoint:** `POST /save-html-report`
+**Endpoint:** `POST /convert-to-docx`
 
 ---
 
@@ -14,51 +14,51 @@
 
 ```json
 {
-  "filename": "automotive_report.html",
-  "html_content": "<html>...</html>"
+  "filename": "automotive_report.docx",
+  "html_content": "<!DOCTYPE html><html>...</html>"
 }
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `filename` | string | Yes | Name of the output file. Must end with `.html`. |
-| `html_content` | string | Yes | Complete HTML content of the report. |
+| `filename` | string | Yes | Name of the output file. Must end with `.docx`. |
+| `html_content` | string | Yes | Complete HTML content including Chart.js scripts. |
 
 ### Filename Rules
 
-- Must end with `.html`.
+- Must end with `.docx`.
 - Will be sanitized server-side (path traversal characters stripped).
-- Use descriptive, lowercase names with underscores (e.g., `automotive_sector_q1_2025.html`).
+- Use descriptive, lowercase names with underscores (e.g., `automotive_sector_q1_2025.docx`).
 
 ---
 
 ## Output Schema
 
-### Success Response
+### Success Response (200)
 
 ```json
 {
   "status": "success",
-  "path": "/Volumes/agentbricks/test/agent_reports/automotive_report.html",
-  "filename": "automotive_report.html"
+  "path": "/Volumes/agentbricks/test/agent_reports/automotive_report.docx",
+  "filename": "automotive_report.docx"
 }
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `status` | string | Always `"success"` on successful save. |
-| `path` | string | Full path where the file was saved. |
-| `filename` | string | Sanitized filename that was used. |
-
-### Error Response
+### Conversion Error Response (422)
 
 ```json
 {
-  "detail": "Failed to write report to /Volumes/agentbricks/test/agent_reports/report.html: [error details]"
+  "detail": "HTML to DOCX conversion failed: [error details]"
 }
 ```
 
-HTTP Status: `500 Internal Server Error`
+### Save Error Response (500)
+
+```json
+{
+  "detail": "Failed to write report to /Volumes/..."
+}
+```
 
 ---
 
@@ -66,46 +66,109 @@ HTTP Status: `500 Internal Server Error`
 
 Include the following in the Supervisor Agent system prompt:
 
-> When the report HTML is generated, always call the save_html_report tool.
-> Do not claim that the report was saved unless the tool returns status = success.
+> You are responsible for generating sector reports as complete HTML documents with Chart.js
+> visualizations. The app will render your HTML in a headless browser, so Chart.js charts
+> will be fully rendered and converted to images in the final Word document.
+>
+> After generating the HTML report, call the `convert_html_to_docx` tool.
+> Do not claim that the report was saved unless the tool returns status = "success".
 
-### Additional Recommended Instructions
+### HTML + Chart.js Generation Guidelines
 
-> - Always generate a descriptive filename that reflects the report content (e.g., `automotive_sector_may_2025.html`).
-> - If the tool returns an error, inform the user that the report could not be saved and include the error message.
-> - Do not modify the HTML content after receiving confirmation of a successful save.
+The agent MUST generate a **complete, self-contained HTML document** for reliable rendering:
+
+1. **Include Chart.js via CDN** in the `<head>`:
+   ```html
+   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+   ```
+
+2. **Use `<canvas>` elements** for charts with explicit dimensions:
+   ```html
+   <div style="width: 800px; height: 400px;">
+       <canvas id="myChart"></canvas>
+   </div>
+   ```
+
+3. **Initialize charts in a `<script>` block** at the end of `<body>`:
+   ```html
+   <script>
+       new Chart(document.getElementById('myChart'), {
+           type: 'bar',
+           data: { labels: [...], datasets: [...] },
+           options: { responsive: true, maintainAspectRatio: false }
+       });
+   </script>
+   ```
+
+4. **Supported chart types**: bar, line, pie, doughnut, radar, polarArea, scatter, bubble
+
+5. **Text content** should use semantic HTML: `<h1>`-`<h6>`, `<p>`, `<table>`, `<ul>/<ol>`, `<strong>`, `<em>`
+
+6. **Tables** should use `<th>` for headers (rendered bold in Word)
+
+### Example HTML with Chart
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <h1>Automotive Sector Revenue Analysis</h1>
+    <p>Revenue has grown steadily over the past 5 years.</p>
+    
+    <div style="width: 800px; height: 400px;">
+        <canvas id="revenueChart"></canvas>
+    </div>
+    
+    <h2>Data Summary</h2>
+    <table>
+        <thead>
+            <tr><th>Year</th><th>Revenue (CZK bn)</th><th>Growth</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>2020</td><td>1,214.0</td><td>-</td></tr>
+            <tr><td>2021</td><td>1,280.3</td><td>+5.5%</td></tr>
+            <tr><td>2022</td><td>1,430.6</td><td>+11.7%</td></tr>
+            <tr><td>2023</td><td>1,716.5</td><td>+20.0%</td></tr>
+            <tr><td>2024</td><td>1,795.0</td><td>+4.6%</td></tr>
+        </tbody>
+    </table>
+    
+    <script>
+        new Chart(document.getElementById('revenueChart'), {
+            type: 'bar',
+            data: {
+                labels: ['2020', '2021', '2022', '2023', '2024'],
+                datasets: [{
+                    label: 'Revenue (CZK billions)',
+                    data: [1214.0, 1280.3, 1430.6, 1716.5, 1795.0],
+                    backgroundColor: 'rgba(102, 126, 234, 0.8)',
+                    borderColor: 'rgba(102, 126, 234, 1)',
+                    borderWidth: 2
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: { legend: { position: 'top' } }
+            }
+        });
+    </script>
+</body>
+</html>
+```
+
+### Additional Agent Instructions
+
+> - Always generate a descriptive filename (e.g., `automotive_sector_may_2025.docx`).
+> - Include the complete HTML in a single tool call — do not split across calls.
+> - Charts will be rendered as static images in the Word document.
+> - If the tool returns an error, inform the user and include the error message.
 > - The saved report path from the response can be shared with the user for direct access.
-
----
-
-## Example Interaction
-
-### Agent generates report and calls tool:
-
-**Tool Call:**
-```json
-{
-  "name": "save_html_report",
-  "arguments": {
-    "filename": "automotive_sector_report_2025.html",
-    "html_content": "<!DOCTYPE html><html><head><title>Automotive Sector Report</title><style>body{font-family:sans-serif;}</style></head><body><h1>Automotive Sector Analysis</h1><p>Key findings...</p></body></html>"
-  }
-}
-```
-
-**Tool Response:**
-```json
-{
-  "status": "success",
-  "path": "/Volumes/agentbricks/test/agent_reports/automotive_sector_report_2025.html",
-  "filename": "automotive_sector_report_2025.html"
-}
-```
-
-### Agent response to user:
-
-> "The automotive sector report has been generated and saved successfully.  
-> You can access it at: `/Volumes/agentbricks/test/agent_reports/automotive_sector_report_2025.html`"
+> - Do NOT use external image URLs — all chart data must be inline in the HTML.
 
 ---
 
@@ -115,3 +178,6 @@ Include the following in the Supervisor Agent system prompt:
 - Authentication is handled by the Databricks Apps framework.
 - The volume path is configurable via `REPORT_VOLUME_PATH` environment variable.
 - Default volume: `/Volumes/agentbricks/test/agent_reports`
+- **Playwright + Chromium** renders JavaScript charts before conversion.
+- The headless browser requires network access to `cdn.jsdelivr.net` for Chart.js CDN.
+- Static HTML (no scripts) is converted directly without browser rendering.

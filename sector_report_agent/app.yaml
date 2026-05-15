@@ -1,14 +1,23 @@
 # Databricks Apps configuration for Sector Report Agent
-# This app exposes an HTTP tool endpoint for a Supervisor Agent
-# to save generated HTML reports into a Unity Catalog Volume.
+# This app renders HTML reports (including Chart.js charts) in a headless browser,
+# converts them to Word documents (.docx), and saves them to a Unity Catalog Volume.
+#
+# NETWORK EGRESS REQUIREMENTS:
+# If your workspace uses Private Link with restricted egress, add these domains
+# to your network policy allowlist:
+#
+#   cdn.jsdelivr.net          - Chart.js CDN (loaded by headless browser at runtime)
+#   playwright.azureedge.net  - Playwright browser download (needed at startup)
+#   *.blob.core.windows.net   - Azure storage (for UC Volumes access)
+#
+# If your workspace has unrestricted egress (default), no action needed.
+# To check for denied connections:
+#   SELECT * FROM system.access.outbound_network
+#   WHERE event_time >= CURRENT_TIMESTAMP() - INTERVAL 2 HOUR;
 
 command:
-  - "uvicorn"
-  - "app.main:app"
-  - "--host"
-  - "0.0.0.0"
-  - "--port"
-  - "8000"
+  - "bash"
+  - "start.sh"
 
 env:
   - name: REPORT_VOLUME_PATH

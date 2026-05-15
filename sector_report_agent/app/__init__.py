@@ -1,1 +1,1 @@
-"""Sector Report Agent - FastAPI application package."""
+"""Sector Report Agent - FastAPI application for HTML-to-DOCX conversion with chart rendering."""
