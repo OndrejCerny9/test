@@ -38,6 +38,26 @@ def get_volume_path() -> str:
     return os.environ.get("REPORT_VOLUME_PATH", DEFAULT_VOLUME_PATH)
 
 
+
+def _find_chart_config_end(text: str) -> int:
+    """Find the end of a Chart config object by matching braces."""
+    brace_count = 0
+    started = False
+    for i, ch in enumerate(text):
+        if ch == '{':
+            brace_count += 1
+            started = True
+        elif ch == '}':
+            brace_count -= 1
+            if started and brace_count == 0:
+                remaining = text[i:]
+                end_match = re.search(r'\)\s*;', remaining)
+                if end_match:
+                    return i + end_match.end()
+                return i + 1
+    return len(text)
+
+
 def _extract_chart_configs(html_content: str) -> list:
     """
     Extract Chart.js configurations from <script> blocks.
@@ -83,22 +103,27 @@ def _extract_chart_configs(html_content: str) -> list:
                 found_charts.append((canvas_id, rest))
 
     for canvas_id, rest in found_charts:
+        # Scope rest to only this chart's config (not subsequent charts)
+        config_end = _find_chart_config_end(rest)
+        rest = rest[:config_end]
+
 
         # Extract chart type
-        type_match = re.search(r'type\s*:\s*[\x27"]([^\x27"]+)[\x27"]', rest[:500])
+        type_match = re.search(r'type\s*:\s*[\x27"]([^\x27"]+)[\x27"]', rest[:1000])
         chart_type = type_match.group(1) if type_match else "bar"
 
         # Extract labels
-        labels_match = re.search(r'labels\s*:\s*\[([^\]]+)\]', rest[:2000])
+        labels_match = re.search(r'labels\s*:\s*\[([^\]]+)\]', rest[:5000])
         labels = []
         if labels_match:
             labels = [l.strip().strip("\x27\"") for l in labels_match.group(1).split(",")]
 
         # Extract datasets
         datasets = []
-        data_arrays = re.findall(r'data\s*:\s*\[([\d.,\s]+)\]', rest[:5000])
-        ds_labels = re.findall(r'label\s*:\s*[\x27"]([^\x27"]+)[\x27"]', rest[:5000])
-        bg_colors = re.findall(r'backgroundColor\s*:\s*[\x27"]([^\x27"]+)[\x27"]', rest[:5000])
+        data_arrays = re.findall(r'data\s*:\s*\[([\d.,\s\-]+)\]', rest[:10000])
+        ds_labels = re.findall(r'label\s*:\s*[\x27"]([^\x27"]+)[\x27"]', rest[:10000])
+        bg_colors = re.findall(r'backgroundColor\s*:\s*[\x27"]([^\x27"]+)[\x27"]', rest[:10000])
+        border_colors = re.findall(r'borderColor\s*:\s*[\x27"]([^\x27"]+)[\x27"]', rest[:10000])
 
         for i, data_str in enumerate(data_arrays):
             try:
@@ -108,13 +133,15 @@ def _extract_chart_configs(html_content: str) -> list:
                     dataset["label"] = ds_labels[i]
                 if i < len(bg_colors):
                     dataset["backgroundColor"] = bg_colors[i]
+                elif i < len(border_colors):
+                    dataset["backgroundColor"] = border_colors[i]
                 datasets.append(dataset)
             except ValueError:
                 continue
 
         # Extract title
         title_text = None
-        title_match = re.search(r'text\s*:\s*[\x27"]([^\x27"]+)[\x27"]', rest[:5000])
+        title_match = re.search(r'text\s*:\s*[\x27"]([^\x27"]+)[\x27"]', rest[:10000])
         if title_match:
             title_text = title_match.group(1)
 
