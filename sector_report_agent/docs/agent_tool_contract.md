@@ -181,8 +181,11 @@ IMPORTANT:
 
 The agent MUST generate Chart.js code following these patterns for reliable regex extraction:
 
-### Required Pattern
+### Supported Patterns
 
+Both of the following Chart.js initialization patterns are supported:
+
+**Pattern 1: Direct (recommended)**
 ```javascript
 new Chart(document.getElementById('uniqueCanvasId'), {
     type: 'bar',
@@ -201,6 +204,30 @@ new Chart(document.getElementById('uniqueCanvasId'), {
     }
 });
 ```
+
+**Pattern 2: Variable-based (also supported)**
+```javascript
+const ctx = document.getElementById('uniqueCanvasId').getContext('2d');
+new Chart(ctx, {
+    type: 'bar',
+    data: {
+        labels: ['A', 'B', 'C'],
+        datasets: [{
+            label: 'My Dataset',
+            data: [10, 20, 30],
+            backgroundColor: 'rgba(102, 126, 234, 0.8)'
+        }]
+    },
+    options: {
+        plugins: {
+            title: { display: true, text: 'Chart Title' }
+        }
+    }
+});
+```
+
+The variable must be assigned via `document.getElementById('id')` (with optional `.getContext('2d')`) and used directly in `new Chart(varName, {...})`.
+
 
 ### Supported Chart Types
 

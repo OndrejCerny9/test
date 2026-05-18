@@ -42,13 +42,47 @@ def _extract_chart_configs(html_content: str) -> list:
     """
     Extract Chart.js configurations from <script> blocks.
     Returns list of dicts with canvas_id and chart config data.
+
+    Handles two patterns:
+    1. new Chart(document.getElementById('id'), {...})
+    2. const ctx = document.getElementById('id').getContext('2d'); new Chart(ctx, {...})
     """
     charts = []
-    pattern = r'new\s+Chart\s*\(\s*document\.getElementById\s*\(\s*[\x27"]([^\x27"]+)[\x27"]\s*\)'
 
-    for match in re.finditer(pattern, html_content):
+    # First, build a map of variable names to canvas IDs
+    # Matches: const/let/var name = document.getElementById('id') or .getContext('2d')
+    var_pattern = r'''(?:const|let|var)\s+(\w+)\s*=\s*document\.getElementById\s*\(\s*['"]([^'"]+)['"]\s*\)'''
+    var_to_canvas = {}
+    for var_match in re.finditer(var_pattern, html_content):
+        var_name = var_match.group(1)
+        canvas_id = var_match.group(2)
+        var_to_canvas[var_name] = canvas_id
+
+    # Pattern 1: new Chart(document.getElementById('id'), {...})
+    pattern1 = r'new\s+Chart\s*\(\s*document\.getElementById\s*\(\s*[\x27"]([^\x27"]+)[\x27"]\s*\)'
+    # Pattern 2: new Chart(variableName, {...})
+    pattern2 = r'new\s+Chart\s*\(\s*(\w+)\s*,'
+
+    found_charts = []  # list of (canvas_id, rest_of_content)
+
+    for match in re.finditer(pattern1, html_content):
         canvas_id = match.group(1)
         rest = html_content[match.end():]
+        found_charts.append((canvas_id, rest))
+
+    for match in re.finditer(pattern2, html_content):
+        var_name = match.group(1)
+        # Skip if var_name is 'document' (would be caught by pattern1)
+        if var_name == 'document':
+            continue
+        if var_name in var_to_canvas:
+            canvas_id = var_to_canvas[var_name]
+            # Check we haven't already found this canvas from pattern1
+            if not any(c[0] == canvas_id for c in found_charts):
+                rest = html_content[match.end():]
+                found_charts.append((canvas_id, rest))
+
+    for canvas_id, rest in found_charts:
 
         # Extract chart type
         type_match = re.search(r'type\s*:\s*[\x27"]([^\x27"]+)[\x27"]', rest[:500])
