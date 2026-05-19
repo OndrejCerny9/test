@@ -399,7 +399,7 @@ def _insert_table_of_contents(doc: Document):
     r_instr = OxmlElement('w:r')
     instrText = OxmlElement('w:instrText')
     instrText.set(_qn('xml:space'), 'preserve')
-    instrText.text = ' TOC \\o "1-3" \\h \\z \\u '
+    instrText.text = ' TOC \\o "2-3" \\h \\z \\u '
     r_instr.append(instrText)
     toc_p.append(r_instr)
     
