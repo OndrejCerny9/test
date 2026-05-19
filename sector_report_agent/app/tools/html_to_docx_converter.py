@@ -347,6 +347,51 @@ def _extract_report_title(html_content: str) -> str:
     return "Sector Report"
 
 
+def _apply_corporate_styling(doc: Document):
+    """
+    Post-process the document to apply corporate fonts and styling.
+    htmldocx creates paragraphs with inline formatting that overrides template styles,
+    so we need to explicitly set the font on all runs.
+    """
+    for paragraph in doc.paragraphs:
+        style_name = paragraph.style.name if paragraph.style else "Normal"
+
+        # Determine font based on style
+        if 'Heading' in style_name:
+            target_font = 'Franklin Gothic Book'
+            target_color = RGBColor(0x24, 0x53, 0x75)
+        elif 'Chart Title' in style_name:
+            target_font = 'Times New Roman'
+            target_color = None
+        elif 'Chart Source' in style_name:
+            target_font = 'Times New Roman'
+            target_color = RGBColor(0x20, 0x20, 0x20)
+        else:
+            target_font = 'Franklin Gothic Book'
+            target_color = None
+
+        for run in paragraph.runs:
+            # Only set font if not already explicitly set
+            if not run.font.name:
+                run.font.name = target_font
+            # Apply heading color
+            if target_color and 'Heading' in style_name:
+                if not run.font.color.rgb:
+                    run.font.color.rgb = target_color
+
+    # Also style table cells
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    for run in paragraph.runs:
+                        if not run.font.name:
+                            run.font.name = 'Franklin Gothic Book'
+                        if not run.font.size:
+                            run.font.size = Pt(9)
+
+
+
 def _build_docx_with_charts(html_content: str, chart_data: dict, report_title: str) -> Document:
     """
     Build DOCX using the corporate template: convert HTML with htmldocx,
@@ -425,7 +470,10 @@ def _build_docx_with_charts(html_content: str, chart_data: dict, report_title: s
                 logger.info(f"Inserted chart with caption: {canvas_id}")
                 break
 
+    _apply_corporate_styling(doc)
     return doc
+
+
 
 
 def _save_to_volume(doc: Document, volume_path: str, filename: str) -> str:
@@ -469,6 +517,7 @@ def convert_html_to_docx(filename: str, html_content: str) -> dict:
             _replace_header_placeholders(doc, report_title, date_str)
             parser = HtmlToDocx()
             parser.add_html_to_document(clean_html, doc)
+            _apply_corporate_styling(doc)
 
     except Exception as e:
         logger.error(f"HTML to DOCX conversion failed: {e}")
