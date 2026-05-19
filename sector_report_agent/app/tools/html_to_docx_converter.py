@@ -2,14 +2,15 @@
 HTML to DOCX Converter Tool
 
 Converts HTML report content (including Chart.js configurations) to a Word
-document (.docx) and saves it to a Unity Catalog Volume.
+document (.docx) with native editable charts and saves it to a Unity Catalog Volume.
 
 Strategy:
 - Load corporate DOCX template (with styles, header/footer, page setup)
 - Extract Chart.js configs via regex (supports both direct and variable patterns)
-- Render charts with matplotlib using corporate color palette
+- Generate native Word charts (OOXML DrawingML) with embedded Excel data
 - Convert HTML text/tables with htmldocx
-- Insert chart images with captions and source citations
+- Insert native chart objects with captions and source citations
+- Insert Table of Contents ("Obsah") after the title
 - Replace header placeholders with actual report title/date
 - Save to UC Volume via Databricks SDK
 """
@@ -18,17 +19,18 @@ import os
 import io
 import re
 import logging
+import zipfile
 from datetime import datetime
 from bs4 import BeautifulSoup
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 from htmldocx import HtmlToDocx
 from databricks.sdk import WorkspaceClient
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import numpy as np
+from openpyxl import Workbook
+from lxml import etree
 
 logger = logging.getLogger(__name__)
 
@@ -36,22 +38,25 @@ DEFAULT_VOLUME_PATH = "/Volumes/agentbricks/volumes/agent_reports"
 
 CHART_PLACEHOLDER = "___CHART_PLACEHOLDER_{}___ "
 
-# Corporate color palette (from reference document)
+# Corporate color palette
 CORPORATE_COLORS = [
-    '#4E5B6F',  # Dark blue-gray (primary)
-    '#007EEA',  # Bright blue
-    '#898989',  # Medium gray
-    '#D6ECFF',  # Light blue
-    '#A7D6FF',  # Sky blue
-    '#FFDF43',  # Yellow accent
-    '#8E9BB0',  # Steel blue
-    '#245375',  # Dark teal (heading color)
-    '#4CAF50',  # Green
-    '#FF6B6B',  # Red accent
+    '4E5B6F',  # Dark blue-gray (primary)
+    '007EEA',  # Bright blue
+    '898989',  # Medium gray
+    'D6ECFF',  # Light blue
+    'A7D6FF',  # Sky blue
+    'FFDF43',  # Yellow accent
+    '8E9BB0',  # Steel blue
+    '245375',  # Dark teal
+    '4CAF50',  # Green
+    'FF6B6B',  # Red accent
 ]
 
-# Template path (relative to the app directory)
+# Template path
 TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "template.docx")
+
+# Chart relationship ID base (use high numbers to avoid conflicts)
+CHART_RID_BASE = 100
 
 
 def get_volume_path() -> str:
@@ -82,26 +87,17 @@ def _extract_chart_configs(html_content: str) -> list:
     """
     Extract Chart.js configurations from <script> blocks.
     Returns list of dicts with canvas_id and chart config data.
-
-    Handles two patterns:
-    1. new Chart(document.getElementById('id'), {...})
-    2. const ctx = document.getElementById('id').getContext('2d'); new Chart(ctx, {...})
     """
     charts = []
-
-    # Build a map of variable names to canvas IDs
-    var_pattern = r"""(?:const|let|var)\s+(\w+)\s*=\s*document\.getElementById\s*\(\s*['"]([^'"]+)['"]\s*\)"""
+    var_pattern = r"""(?:const|let|var)\s+(\w+)\s*=\s*document\.getElementById\s*\(\s*['\"]([^'\"]+)['\"]\s*\)"""
     var_to_canvas = {}
     for var_match in re.finditer(var_pattern, html_content):
         var_to_canvas[var_match.group(1)] = var_match.group(2)
 
-    # Pattern 1: direct
-    pattern1 = r'new\s+Chart\s*\(\s*document\.getElementById\s*\(\s*[\x27"]([^\x27"]+)[\x27"]\s*\)'
-    # Pattern 2: variable
+    pattern1 = r'new\s+Chart\s*\(\s*document\.getElementById\s*\(\s*[\x27\"]([^\x27\"]+)[\x27\"]\s*\)'
     pattern2 = r'new\s+Chart\s*\(\s*(\w+)\s*,'
 
     found_charts = []
-
     for match in re.finditer(pattern1, html_content):
         canvas_id = match.group(1)
         rest = html_content[match.end():]
@@ -118,25 +114,21 @@ def _extract_chart_configs(html_content: str) -> list:
                 found_charts.append((canvas_id, rest))
 
     for canvas_id, rest in found_charts:
-        # Scope rest to only this chart's config
         config_end = _find_chart_config_end(rest)
         rest = rest[:config_end]
 
-        # Extract chart type
-        type_match = re.search(r'type\s*:\s*[\x27"]([^\x27"]+)[\x27"]', rest[:1000])
+        type_match = re.search(r'type\s*:\s*[\x27\"]([^\x27\"]+)[\x27\"]', rest[:1000])
         chart_type = type_match.group(1) if type_match else "bar"
 
-        # Extract labels
         labels_match = re.search(r'labels\s*:\s*\[([^\]]+)\]', rest[:5000])
         labels = []
         if labels_match:
-            labels = [l.strip().strip("\x27\"") for l in labels_match.group(1).split(",")]
+            labels = [l.strip().strip("\x27\\\"") for l in labels_match.group(1).split(",")]
 
-        # Extract datasets
         data_arrays = re.findall(r'data\s*:\s*\[([\d.,\s\-]+)\]', rest[:10000])
-        ds_labels = re.findall(r'label\s*:\s*[\x27"]([^\x27"]+)[\x27"]', rest[:10000])
-        bg_colors = re.findall(r'backgroundColor\s*:\s*[\x27"]([^\x27"]+)[\x27"]', rest[:10000])
-        border_colors = re.findall(r'borderColor\s*:\s*[\x27"]([^\x27"]+)[\x27"]', rest[:10000])
+        ds_labels = re.findall(r'label\s*:\s*[\x27\"]([^\x27\"]+)[\x27\"]', rest[:10000])
+        bg_colors = re.findall(r'backgroundColor\s*:\s*[\x27\"]([^\x27\"]+)[\x27\"]', rest[:10000])
+        border_colors = re.findall(r'borderColor\s*:\s*[\x27\"]([^\x27\"]+)[\x27\"]', rest[:10000])
 
         datasets = []
         for i, data_str in enumerate(data_arrays):
@@ -153,9 +145,8 @@ def _extract_chart_configs(html_content: str) -> list:
             except ValueError:
                 continue
 
-        # Extract title
         title_text = None
-        title_match = re.search(r'text\s*:\s*[\x27"]([^\x27"]+)[\x27"]', rest[:10000])
+        title_match = re.search(r'text\s*:\s*[\x27\"]([^\x27\"]+)[\x27\"]', rest[:10000])
         if title_match:
             title_text = title_match.group(1)
 
@@ -172,124 +163,252 @@ def _extract_chart_configs(html_content: str) -> list:
     return charts
 
 
-def _parse_color(color_str) -> tuple:
-    """Parse rgba/rgb/hex color string to matplotlib-compatible format."""
+def _parse_color_to_hex(color_str) -> str:
+    """Parse rgba/rgb/hex color string to 6-digit hex (no #)."""
     if not isinstance(color_str, str):
         return CORPORATE_COLORS[0]
     color_str = color_str.strip()
-    rgba_match = re.match(r'rgba?\(([\d.]+),\s*([\d.]+),\s*([\d.]+)(?:,\s*([\d.]+))?\)', color_str)
+    rgba_match = re.match(r'rgba?\(([\d.]+),\s*([\d.]+),\s*([\d.]+)', color_str)
     if rgba_match:
         r = int(float(rgba_match.group(1)))
         g = int(float(rgba_match.group(2)))
         b = int(float(rgba_match.group(3)))
-        a = float(rgba_match.group(4)) if rgba_match.group(4) else 1.0
-        return (r/255, g/255, b/255, a)
+        return f'{r:02X}{g:02X}{b:02X}'
     if color_str.startswith('#'):
-        return color_str
+        return color_str.lstrip('#').upper()
     return CORPORATE_COLORS[0]
 
 
-def _render_chart_to_png_bytes(config: dict) -> bytes:
-    """Render a chart config to PNG bytes using matplotlib with corporate styling."""
+def _create_chart_xml(config: dict, chart_index: int) -> bytes:
+    """
+    Create a native Word chart XML (DrawingML c:chartSpace) from chart config.
+    Supports bar, line, pie, doughnut.
+    """
     chart_type = config.get("type", "bar")
     labels = config.get("labels", [])
     datasets = config.get("datasets", [])
     title = config.get("title")
 
-    # Use corporate style
-    plt.rcParams.update({
-        'font.family': 'sans-serif',
-        'font.sans-serif': ['Franklin Gothic Book', 'Arial', 'DejaVu Sans'],
-        'font.size': 10,
-        'axes.titlesize': 12,
-        'axes.labelsize': 10,
-    })
+    C = 'http://schemas.openxmlformats.org/drawingml/2006/chart'
+    A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+    R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+    nsmap = {'c': C, 'a': A, 'r': R}
 
-    fig, ax = plt.subplots(figsize=(10, 4.5))
+    chartSpace = etree.Element(f'{{{C}}}chartSpace', nsmap=nsmap)
+    chart_el = etree.SubElement(chartSpace, f'{{{C}}}chart')
 
-    if chart_type == "bar":
-        x = np.arange(len(labels))
-        n_datasets = max(len(datasets), 1)
-        width = 0.8 / n_datasets
-        for i, ds in enumerate(datasets):
-            offset = (i - n_datasets / 2 + 0.5) * width
-            color = _parse_color(ds.get("backgroundColor", CORPORATE_COLORS[i % len(CORPORATE_COLORS)]))
-            ax.bar(x + offset, ds.get("data", []), width,
-                   label=ds.get("label", ""), color=color)
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, fontsize=9)
+    # Title
+    if title:
+        title_el = etree.SubElement(chart_el, f'{{{C}}}title')
+        tx = etree.SubElement(title_el, f'{{{C}}}tx')
+        rich = etree.SubElement(tx, f'{{{C}}}rich')
+        etree.SubElement(rich, f'{{{A}}}bodyPr')
+        etree.SubElement(rich, f'{{{A}}}lstStyle')
+        p = etree.SubElement(rich, f'{{{A}}}p')
+        pPr = etree.SubElement(p, f'{{{A}}}pPr')
+        defRPr = etree.SubElement(pPr, f'{{{A}}}defRPr')
+        defRPr.set('sz', '1100'); defRPr.set('b', '1')
+        r = etree.SubElement(p, f'{{{A}}}r')
+        rPr = etree.SubElement(r, f'{{{A}}}rPr')
+        rPr.set('lang', 'cs-CZ'); rPr.set('sz', '1100'); rPr.set('b', '1')
+        t_el = etree.SubElement(r, f'{{{A}}}t')
+        t_el.text = title
+        etree.SubElement(title_el, f'{{{C}}}overlay').set('val', '0')
 
-    elif chart_type == "line":
-        for i, ds in enumerate(datasets):
-            color = _parse_color(ds.get("backgroundColor", CORPORATE_COLORS[i % len(CORPORATE_COLORS)]))
-            ax.plot(labels, ds.get("data", []), marker='o', linewidth=2.5,
-                    label=ds.get("label", ""), color=color, markersize=5)
+    etree.SubElement(chart_el, f'{{{C}}}autoTitleDeleted').set('val', '0')
+    plotArea = etree.SubElement(chart_el, f'{{{C}}}plotArea')
+    etree.SubElement(plotArea, f'{{{C}}}layout')
 
-    elif chart_type in ("pie", "doughnut"):
+    # Determine chart element type
+    if chart_type in ('pie', 'doughnut'):
+        chart_elem_tag = f'{{{C}}}pieChart' if chart_type == 'pie' else f'{{{C}}}doughnutChart'
+        chart_elem = etree.SubElement(plotArea, chart_elem_tag)
+        etree.SubElement(chart_elem, f'{{{C}}}varyColors').set('val', '1')
+
+        # For pie/doughnut, use first dataset only
         if datasets:
             ds = datasets[0]
-            colors = [_parse_color(CORPORATE_COLORS[i % len(CORPORATE_COLORS)]) for i in range(len(labels))]
-            wedgeprops = {"width": 0.4} if chart_type == "doughnut" else {}
-            ax.pie(ds.get("data", []), labels=labels, colors=colors,
-                   autopct='%1.1f%%', wedgeprops=wedgeprops,
-                   textprops={'fontsize': 9})
-            ax.set_aspect('equal')
+            ser = etree.SubElement(chart_elem, f'{{{C}}}ser')
+            etree.SubElement(ser, f'{{{C}}}idx').set('val', '0')
+            etree.SubElement(ser, f'{{{C}}}order').set('val', '0')
+
+            # Series name
+            tx = etree.SubElement(ser, f'{{{C}}}tx')
+            strRef = etree.SubElement(tx, f'{{{C}}}strRef')
+            etree.SubElement(strRef, f'{{{C}}}f').text = "Sheet1!$B$1"
+            sc = etree.SubElement(strRef, f'{{{C}}}strCache')
+            etree.SubElement(sc, f'{{{C}}}ptCount').set('val', '1')
+            pt = etree.SubElement(sc, f'{{{C}}}pt'); pt.set('idx', '0')
+            etree.SubElement(pt, f'{{{C}}}v').text = ds.get('label', 'Data')
+
+            # Color each slice
+            for i in range(len(labels)):
+                dPt = etree.SubElement(ser, f'{{{C}}}dPt')
+                etree.SubElement(dPt, f'{{{C}}}idx').set('val', str(i))
+                spPr = etree.SubElement(dPt, f'{{{C}}}spPr')
+                sf = etree.SubElement(spPr, f'{{{A}}}solidFill')
+                etree.SubElement(sf, f'{{{A}}}srgbClr').set('val', CORPORATE_COLORS[i % len(CORPORATE_COLORS)])
+
+            # Categories
+            cat_el = etree.SubElement(ser, f'{{{C}}}cat')
+            sr_c = etree.SubElement(cat_el, f'{{{C}}}strRef')
+            etree.SubElement(sr_c, f'{{{C}}}f').text = f"Sheet1!$A$2:$A${len(labels)+1}"
+            sc_c = etree.SubElement(sr_c, f'{{{C}}}strCache')
+            etree.SubElement(sc_c, f'{{{C}}}ptCount').set('val', str(len(labels)))
+            for i, cn in enumerate(labels):
+                pc = etree.SubElement(sc_c, f'{{{C}}}pt'); pc.set('idx', str(i))
+                etree.SubElement(pc, f'{{{C}}}v').text = cn
+
+            # Values
+            val_el = etree.SubElement(ser, f'{{{C}}}val')
+            nr = etree.SubElement(val_el, f'{{{C}}}numRef')
+            etree.SubElement(nr, f'{{{C}}}f').text = f"Sheet1!$B$2:$B${len(ds['data'])+1}"
+            nc = etree.SubElement(nr, f'{{{C}}}numCache')
+            etree.SubElement(nc, f'{{{C}}}formatCode').text = '#,##0'
+            etree.SubElement(nc, f'{{{C}}}ptCount').set('val', str(len(ds['data'])))
+            for i, v in enumerate(ds['data']):
+                pv = etree.SubElement(nc, f'{{{C}}}pt'); pv.set('idx', str(i))
+                etree.SubElement(pv, f'{{{C}}}v').text = str(v)
+
+        if chart_type == 'doughnut':
+            etree.SubElement(chart_elem, f'{{{C}}}holeSize').set('val', '50')
+
     else:
-        # Fallback to bar
-        x = np.arange(len(labels))
-        if datasets:
-            color = _parse_color(datasets[0].get("backgroundColor", CORPORATE_COLORS[0]))
-            ax.bar(x, datasets[0].get("data", []), color=color,
-                   label=datasets[0].get("label", ""))
-            ax.set_xticks(x)
-            ax.set_xticklabels(labels, fontsize=9)
+        # Bar or Line chart
+        if chart_type == 'line':
+            chart_elem = etree.SubElement(plotArea, f'{{{C}}}lineChart')
+            etree.SubElement(chart_elem, f'{{{C}}}grouping').set('val', 'standard')
+        else:
+            chart_elem = etree.SubElement(plotArea, f'{{{C}}}barChart')
+            etree.SubElement(chart_elem, f'{{{C}}}barDir').set('val', 'col')
+            etree.SubElement(chart_elem, f'{{{C}}}grouping').set('val', 'clustered')
 
-    if title:
-        ax.set_title(title, fontsize=12, fontweight='bold', pad=12, color='#245375')
+        etree.SubElement(chart_elem, f'{{{C}}}varyColors').set('val', '0')
 
-    if chart_type not in ("pie", "doughnut"):
-        if any(ds.get("label") for ds in datasets):
-            ax.legend(loc='upper left', fontsize=9, framealpha=0.9)
+        for idx, ds in enumerate(datasets):
+            ser = etree.SubElement(chart_elem, f'{{{C}}}ser')
+            etree.SubElement(ser, f'{{{C}}}idx').set('val', str(idx))
+            etree.SubElement(ser, f'{{{C}}}order').set('val', str(idx))
 
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.grid(axis='y', alpha=0.3, linestyle='--')
-    plt.tight_layout()
+            # Series name
+            tx = etree.SubElement(ser, f'{{{C}}}tx')
+            strRef = etree.SubElement(tx, f'{{{C}}}strRef')
+            etree.SubElement(strRef, f'{{{C}}}f').text = f"Sheet1!${chr(66+idx)}$1"
+            sc = etree.SubElement(strRef, f'{{{C}}}strCache')
+            etree.SubElement(sc, f'{{{C}}}ptCount').set('val', '1')
+            pt = etree.SubElement(sc, f'{{{C}}}pt'); pt.set('idx', '0')
+            etree.SubElement(pt, f'{{{C}}}v').text = ds.get('label', f'Series {idx+1}')
 
-    buffer = io.BytesIO()
-    fig.savefig(buffer, format='png', dpi=150, bbox_inches='tight', facecolor='white')
-    plt.close(fig)
-    buffer.seek(0)
-    return buffer.read()
+            # Color
+            color_hex = CORPORATE_COLORS[idx % len(CORPORATE_COLORS)]
+            if 'backgroundColor' in ds:
+                color_hex = _parse_color_to_hex(ds['backgroundColor'])
+            spPr = etree.SubElement(ser, f'{{{C}}}spPr')
+            sf = etree.SubElement(spPr, f'{{{A}}}solidFill')
+            etree.SubElement(sf, f'{{{A}}}srgbClr').set('val', color_hex)
+
+            if chart_type == 'line':
+                ln = etree.SubElement(spPr, f'{{{A}}}ln')
+                ln.set('w', '28575')
+                sf_ln = etree.SubElement(ln, f'{{{A}}}solidFill')
+                etree.SubElement(sf_ln, f'{{{A}}}srgbClr').set('val', color_hex)
+                # Marker
+                marker = etree.SubElement(ser, f'{{{C}}}marker')
+                etree.SubElement(marker, f'{{{C}}}symbol').set('val', 'circle')
+                etree.SubElement(marker, f'{{{C}}}size').set('val', '5')
+
+            # Categories
+            cat_el = etree.SubElement(ser, f'{{{C}}}cat')
+            sr_c = etree.SubElement(cat_el, f'{{{C}}}strRef')
+            etree.SubElement(sr_c, f'{{{C}}}f').text = f"Sheet1!$A$2:$A${len(labels)+1}"
+            sc_c = etree.SubElement(sr_c, f'{{{C}}}strCache')
+            etree.SubElement(sc_c, f'{{{C}}}ptCount').set('val', str(len(labels)))
+            for i, cn in enumerate(labels):
+                pc = etree.SubElement(sc_c, f'{{{C}}}pt'); pc.set('idx', str(i))
+                etree.SubElement(pc, f'{{{C}}}v').text = cn
+
+            # Values
+            val_el = etree.SubElement(ser, f'{{{C}}}val')
+            numRef = etree.SubElement(val_el, f'{{{C}}}numRef')
+            etree.SubElement(numRef, f'{{{C}}}f').text = f"Sheet1!${chr(66+idx)}$2:${chr(66+idx)}${len(ds['data'])+1}"
+            nc = etree.SubElement(numRef, f'{{{C}}}numCache')
+            etree.SubElement(nc, f'{{{C}}}formatCode').text = '#,##0'
+            etree.SubElement(nc, f'{{{C}}}ptCount').set('val', str(len(ds['data'])))
+            for i, v in enumerate(ds['data']):
+                pv = etree.SubElement(nc, f'{{{C}}}pt'); pv.set('idx', str(i))
+                etree.SubElement(pv, f'{{{C}}}v').text = str(v)
+
+        # Axes (not for pie/doughnut)
+        etree.SubElement(chart_elem, f'{{{C}}}axId').set('val', '1')
+        etree.SubElement(chart_elem, f'{{{C}}}axId').set('val', '2')
+
+        catAx = etree.SubElement(plotArea, f'{{{C}}}catAx')
+        etree.SubElement(catAx, f'{{{C}}}axId').set('val', '1')
+        s1 = etree.SubElement(catAx, f'{{{C}}}scaling')
+        etree.SubElement(s1, f'{{{C}}}orientation').set('val', 'minMax')
+        etree.SubElement(catAx, f'{{{C}}}delete').set('val', '0')
+        etree.SubElement(catAx, f'{{{C}}}axPos').set('val', 'b')
+        etree.SubElement(catAx, f'{{{C}}}crossAx').set('val', '2')
+
+        valAx = etree.SubElement(plotArea, f'{{{C}}}valAx')
+        etree.SubElement(valAx, f'{{{C}}}axId').set('val', '2')
+        s2 = etree.SubElement(valAx, f'{{{C}}}scaling')
+        etree.SubElement(s2, f'{{{C}}}orientation').set('val', 'minMax')
+        etree.SubElement(valAx, f'{{{C}}}delete').set('val', '0')
+        etree.SubElement(valAx, f'{{{C}}}axPos').set('val', 'l')
+        etree.SubElement(valAx, f'{{{C}}}crossAx').set('val', '1')
+
+    # Legend
+    legend = etree.SubElement(chart_el, f'{{{C}}}legend')
+    etree.SubElement(legend, f'{{{C}}}legendPos').set('val', 'b')
+    etree.SubElement(legend, f'{{{C}}}overlay').set('val', '0')
+    etree.SubElement(chart_el, f'{{{C}}}plotVisOnly').set('val', '1')
+
+    # External data reference
+    extData = etree.SubElement(chartSpace, f'{{{C}}}externalData')
+    extData.set(f'{{{R}}}id', 'rId1')
+    etree.SubElement(extData, f'{{{C}}}autoUpdate').set('val', '0')
+
+    return etree.tostring(chartSpace, xml_declaration=True, encoding='UTF-8', standalone=True)
+
+
+def _create_chart_xlsx(config: dict) -> bytes:
+    """Create embedded Excel workbook with chart data."""
+    labels = config.get("labels", [])
+    datasets = config.get("datasets", [])
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws.cell(1, 1, "Category")
+    for i, ds in enumerate(datasets):
+        ws.cell(1, i + 2, ds.get('label', f'Series {i+1}'))
+    for row_idx, label in enumerate(labels):
+        ws.cell(row_idx + 2, 1, label)
+        for col_idx, ds in enumerate(datasets):
+            if row_idx < len(ds.get('data', [])):
+                ws.cell(row_idx + 2, col_idx + 2, ds['data'][row_idx])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 def _prepare_html_and_charts(html_content: str) -> tuple:
     """
     Process HTML: extract charts, replace canvas elements with placeholders,
-    remove scripts/styles, return clean HTML and chart image bytes.
-
-    Returns: (clean_html_str, dict_of_chart_id_to_png_bytes_and_title)
+    remove scripts/styles, return clean HTML and chart configs.
     """
     charts = _extract_chart_configs(html_content)
     chart_data = {}
 
-    # Render each chart
     for chart_info in charts:
         canvas_id = chart_info["canvas_id"]
         config = chart_info["config"]
-        try:
-            png_bytes = _render_chart_to_png_bytes(config)
-            chart_data[canvas_id] = {
-                "png_bytes": png_bytes,
-                "title": config.get("title"),
-            }
-            logger.info(f"Rendered chart: {canvas_id}")
-        except Exception as e:
-            logger.warning(f"Failed to render chart {canvas_id}: {e}")
+        chart_data[canvas_id] = {"config": config, "title": config.get("title")}
+        logger.info(f"Prepared chart config: {canvas_id}")
 
-    # Process the HTML - replace canvas elements with text placeholders
     soup = BeautifulSoup(html_content, "html.parser")
-
     for canvas_id in chart_data:
         canvas = soup.find("canvas", {"id": canvas_id})
         if canvas:
@@ -301,13 +420,11 @@ def _prepare_html_and_charts(html_content: str) -> tuple:
             else:
                 canvas.replace_with(placeholder)
 
-    # Remove scripts and styles
     for tag in soup.find_all(["script", "style"]):
         tag.decompose()
 
     body = soup.find("body")
     clean_html = str(body) if body else str(soup)
-
     return clean_html, chart_data
 
 
@@ -347,32 +464,25 @@ def _extract_report_title(html_content: str) -> str:
     return "Sector Report"
 
 
-
-
 def _insert_table_of_contents(doc: Document):
     """
     Insert a Table of Contents page after the first heading (title).
-    Adds 'Obsah' heading, a TOC field code, and a page break.
-    Word will auto-populate the TOC entries when the document is opened/updated.
     """
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn as _qn
-    
-    # Find the first Heading 1 paragraph (the title)
+
     insert_after_idx = None
     for i, para in enumerate(doc.paragraphs):
         if para.style and 'Heading 1' in para.style.name:
             insert_after_idx = i
             break
-    
+
     if insert_after_idx is None:
         insert_after_idx = 0
-    
-    # We'll insert after the title paragraph
-    # Get the element to insert after
+
     title_element = doc.paragraphs[insert_after_idx]._element
-    
-    # Create "Obsah" heading paragraph
+
+    # "Obsah" heading
     obsah_p = OxmlElement('w:p')
     obsah_pPr = OxmlElement('w:pPr')
     obsah_pStyle = OxmlElement('w:pStyle')
@@ -384,77 +494,59 @@ def _insert_table_of_contents(doc: Document):
     obsah_t.text = 'Obsah'
     obsah_r.append(obsah_t)
     obsah_p.append(obsah_r)
-    
-    # Create TOC field paragraph
+
+    # TOC field
     toc_p = OxmlElement('w:p')
-    
-    # Field begin
     r_begin = OxmlElement('w:r')
     fldChar_begin = OxmlElement('w:fldChar')
     fldChar_begin.set(_qn('w:fldCharType'), 'begin')
     r_begin.append(fldChar_begin)
     toc_p.append(r_begin)
-    
-    # Field instruction
+
     r_instr = OxmlElement('w:r')
     instrText = OxmlElement('w:instrText')
     instrText.set(_qn('xml:space'), 'preserve')
     instrText.text = ' TOC \\o "2-3" \\h \\z \\u '
     r_instr.append(instrText)
     toc_p.append(r_instr)
-    
-    # Field separate
+
     r_sep = OxmlElement('w:r')
     fldChar_sep = OxmlElement('w:fldChar')
     fldChar_sep.set(_qn('w:fldCharType'), 'separate')
     r_sep.append(fldChar_sep)
     toc_p.append(r_sep)
-    
-    # Placeholder text (shown before Word updates the field)
+
     r_placeholder = OxmlElement('w:r')
-    rPr_placeholder = OxmlElement('w:rPr')
-    rFonts_ph = OxmlElement('w:rFonts')
-    rFonts_ph.set(_qn('w:ascii'), 'Franklin Gothic Book')
-    rFonts_ph.set(_qn('w:hAnsi'), 'Franklin Gothic Book')
-    rPr_placeholder.append(rFonts_ph)
-    r_placeholder.append(rPr_placeholder)
     t_placeholder = OxmlElement('w:t')
-    t_placeholder.text = 'Aktualizujte obsah kliknutím pravým tlačítkem a výběrem "Aktualizovat pole"'
+    t_placeholder.text = 'Right-click and select "Update Field" to populate'
     r_placeholder.append(t_placeholder)
     toc_p.append(r_placeholder)
-    
-    # Field end
+
     r_end = OxmlElement('w:r')
     fldChar_end = OxmlElement('w:fldChar')
     fldChar_end.set(_qn('w:fldCharType'), 'end')
     r_end.append(fldChar_end)
     toc_p.append(r_end)
-    
-    # Page break paragraph
+
+    # Page break
     pagebreak_p = OxmlElement('w:p')
     pb_r = OxmlElement('w:r')
     pb_br = OxmlElement('w:br')
     pb_br.set(_qn('w:type'), 'page')
     pb_r.append(pb_br)
     pagebreak_p.append(pb_r)
-    
-    # Insert in reverse order (after title): page break, TOC field, Obsah heading
+
+    # Insert in reverse order
     title_element.addnext(pagebreak_p)
     title_element.addnext(toc_p)
     title_element.addnext(obsah_p)
-    
     logger.info("Inserted Table of Contents (Obsah) after title")
 
+
 def _apply_corporate_styling(doc: Document):
-    """
-    Post-process the document to apply corporate fonts and styling.
-    htmldocx creates paragraphs with inline formatting that overrides template styles,
-    so we need to explicitly set the font on all runs.
-    """
+    """Post-process the document to apply corporate fonts."""
     for paragraph in doc.paragraphs:
         style_name = paragraph.style.name if paragraph.style else "Normal"
-
-        # Determine font based on style
         if 'Heading' in style_name:
             target_font = 'Franklin Gothic Book'
             target_color = RGBColor(0x24, 0x53, 0x75)
@@ -469,15 +561,12 @@ def _apply_corporate_styling(doc: Document):
             target_color = None
 
         for run in paragraph.runs:
-            # Only set font if not already explicitly set
             if not run.font.name:
                 run.font.name = target_font
-            # Apply heading color
             if target_color and 'Heading' in style_name:
                 if not run.font.color.rgb:
                     run.font.color.rgb = target_color
 
-    # Also style table cells
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
@@ -489,144 +578,220 @@ def _apply_corporate_styling(doc: Document):
                             run.font.size = Pt(9)
 
 
-
 def _build_docx_with_charts(html_content: str, chart_data: dict, report_title: str) -> Document:
     """
-    Build DOCX using the corporate template: convert HTML with htmldocx,
-    then find placeholder paragraphs and replace them with chart images
-    including title and source caption.
+    Build DOCX using the corporate template with native Word charts.
+    Two-pass approach:
+    1. Build document with placeholder paragraphs containing chart drawing references
+    2. Post-process the ZIP to inject chart XML and embedded Excel files
     """
     doc = _load_template()
-
-    # Replace header placeholders
     date_str = datetime.now().strftime("%B %Y")
     _replace_header_placeholders(doc, report_title, date_str)
 
-    # Convert HTML to DOCX content
+    # Convert HTML
     parser = HtmlToDocx()
     parser.add_html_to_document(html_content, doc)
 
-    # Insert Table of Contents after the title
+    # Insert TOC
     _insert_table_of_contents(doc)
 
-    # Find and replace placeholder paragraphs with charts
+    # Track chart insertion info
+    chart_insertions = []  # list of (chart_index, canvas_id, config)
+
+    # Find and replace placeholder paragraphs with chart drawing references
+    chart_index = 0
     for canvas_id, data in chart_data.items():
         placeholder_text = CHART_PLACEHOLDER.format(canvas_id).strip()
-        png_bytes = data["png_bytes"]
+        config = data["config"]
         chart_title = data.get("title")
 
         for i, paragraph in enumerate(doc.paragraphs):
             if placeholder_text in paragraph.text:
-                # Clear the placeholder text
                 paragraph.clear()
 
-                # Add chart title above (using Chart Title style if available)
+                # Add chart title above
                 if chart_title:
-                    # Insert title paragraph before the current one
                     title_para = paragraph.insert_paragraph_before(chart_title)
                     try:
                         title_para.style = doc.styles['Chart Title']
                     except KeyError:
-                        # Fallback: manual formatting
                         for run in title_para.runs:
                             run.font.name = 'Times New Roman'
                             run.font.size = Pt(10)
                             run.font.bold = True
 
-                # Add the chart image
-                run = paragraph.add_run()
-                image_stream = io.BytesIO(png_bytes)
-                run.add_picture(image_stream, width=Cm(16.0))
+                # Insert inline chart drawing reference
+                chart_rid = f'rId{CHART_RID_BASE + chart_index}'
+                cx = int(16 * 914400 / 2.54)  # 16cm width
+                cy = int(9 * 914400 / 2.54)   # 9cm height
 
-                # Add source citation after the chart using OxmlElement
-                from docx.oxml import OxmlElement
-                from docx.oxml.ns import qn as _qn
-                # Create a new paragraph element after current one
+                W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+                WP = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
+                A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+                R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+                C_NS = 'http://schemas.openxmlformats.org/drawingml/2006/chart'
+
+                run = paragraph.add_run()
+                drawing = OxmlElement('w:drawing')
+
+                inline = etree.SubElement(drawing, f'{{{WP}}}inline')
+                inline.set('distT', '0'); inline.set('distB', '0')
+                inline.set('distL', '0'); inline.set('distR', '0')
+                ext_el = etree.SubElement(inline, f'{{{WP}}}extent')
+                ext_el.set('cx', str(cx)); ext_el.set('cy', str(cy))
+                eff = etree.SubElement(inline, f'{{{WP}}}effectExtent')
+                eff.set('l', '0'); eff.set('t', '0'); eff.set('r', '0'); eff.set('b', '0')
+                dp = etree.SubElement(inline, f'{{{WP}}}docPr')
+                dp.set('id', str(chart_index + 10)); dp.set('name', f'Chart {chart_index + 1}')
+                etree.SubElement(inline, f'{{{WP}}}cNvGraphicFramePr')
+                graphic = etree.SubElement(inline, f'{{{A}}}graphic')
+                gd = etree.SubElement(graphic, f'{{{A}}}graphicData')
+                gd.set('uri', C_NS)
+                cr = etree.SubElement(gd, f'{{{C_NS}}}chart')
+                cr.set(f'{{{R_NS}}}id', chart_rid)
+
+                run._r.append(drawing)
+
+                # Source citation after chart
                 new_p_elem = OxmlElement('w:p')
-                # Add run with source text
                 new_r_elem = OxmlElement('w:r')
-                # Run properties (italic, font, size, color)
                 rPr = OxmlElement('w:rPr')
                 rFonts = OxmlElement('w:rFonts')
-                rFonts.set(_qn('w:ascii'), 'Times New Roman')
-                rFonts.set(_qn('w:hAnsi'), 'Times New Roman')
+                rFonts.set(qn('w:ascii'), 'Times New Roman')
+                rFonts.set(qn('w:hAnsi'), 'Times New Roman')
                 rPr.append(rFonts)
-                sz = OxmlElement('w:sz')
-                sz.set(_qn('w:val'), '18')  # 9pt = 18 half-points
+                sz = OxmlElement('w:sz'); sz.set(qn('w:val'), '18')
                 rPr.append(sz)
-                italic = OxmlElement('w:i')
-                rPr.append(italic)
-                color_elem = OxmlElement('w:color')
-                color_elem.set(_qn('w:val'), '202020')
-                rPr.append(color_elem)
+                italic_el = OxmlElement('w:i'); rPr.append(italic_el)
+                color_el = OxmlElement('w:color'); color_el.set(qn('w:val'), '202020')
+                rPr.append(color_el)
                 new_r_elem.append(rPr)
-                # Text
                 t_elem = OxmlElement('w:t')
                 t_elem.text = "Zdroj: Vlastní zpracování"
                 new_r_elem.append(t_elem)
                 new_p_elem.append(new_r_elem)
-                # Insert after current paragraph
                 paragraph._element.addnext(new_p_elem)
 
-                logger.info(f"Inserted chart with caption: {canvas_id}")
+                chart_insertions.append((chart_index, canvas_id, config))
+                chart_index += 1
+                logger.info(f"Inserted native chart reference: {canvas_id} (chart{chart_index})")
                 break
 
     _apply_corporate_styling(doc)
-    return doc
+    return doc, chart_insertions
 
 
+def _inject_charts_into_docx(doc_bytes: bytes, chart_insertions: list) -> bytes:
+    """
+    Post-process the .docx ZIP to inject chart XML parts and embedded Excel files.
+    """
+    if not chart_insertions:
+        return doc_bytes
+
+    input_buf = io.BytesIO(doc_bytes)
+    output_buf = io.BytesIO()
+
+    with zipfile.ZipFile(input_buf, 'r') as zin:
+        with zipfile.ZipFile(output_buf, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+
+                if item.filename == '[Content_Types].xml':
+                    tree = etree.fromstring(data)
+                    ns = 'http://schemas.openxmlformats.org/package/2006/content-types'
+                    for ci, _, _ in chart_insertions:
+                        ov = etree.SubElement(tree, f'{{{ns}}}Override')
+                        ov.set('PartName', f'/word/charts/chart{ci+1}.xml')
+                        ov.set('ContentType', 'application/vnd.openxmlformats-officedocument.drawingml.chart+xml')
+                        ov2 = etree.SubElement(tree, f'{{{ns}}}Override')
+                        ov2.set('PartName', f'/word/embeddings/Microsoft_Excel_Worksheet{ci+1}.xlsx')
+                        ov2.set('ContentType', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                    data = etree.tostring(tree, xml_declaration=True, encoding='UTF-8', standalone=True)
+
+                elif item.filename == 'word/_rels/document.xml.rels':
+                    tree = etree.fromstring(data)
+                    ns_r = 'http://schemas.openxmlformats.org/package/2006/relationships'
+                    for ci, _, _ in chart_insertions:
+                        nr = etree.SubElement(tree, f'{{{ns_r}}}Relationship')
+                        nr.set('Id', f'rId{CHART_RID_BASE + ci}')
+                        nr.set('Type', 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart')
+                        nr.set('Target', f'charts/chart{ci+1}.xml')
+                    data = etree.tostring(tree, xml_declaration=True, encoding='UTF-8', standalone=True)
+
+                zout.writestr(item, data)
+
+            # Add chart files
+            for ci, canvas_id, config in chart_insertions:
+                chart_xml = _create_chart_xml(config, ci)
+                xlsx_data = _create_chart_xlsx(config)
+                zout.writestr(f'word/charts/chart{ci+1}.xml', chart_xml)
+                zout.writestr(f'word/embeddings/Microsoft_Excel_Worksheet{ci+1}.xlsx', xlsx_data)
+                # Chart rels
+                chart_rels = (
+                    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                    f'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/package" Target="../embeddings/Microsoft_Excel_Worksheet{ci+1}.xlsx"/>'
+                    '</Relationships>'
+                )
+                zout.writestr(f'word/charts/_rels/chart{ci+1}.xml.rels', chart_rels)
+
+    output_buf.seek(0)
+    return output_buf.getvalue()
 
 
-def _save_to_volume(doc: Document, volume_path: str, filename: str) -> str:
-    """Save a DOCX document to a UC Volume using the Databricks SDK."""
-    buffer = io.BytesIO()
-    doc.save(buffer)
-    buffer.seek(0)
-
+def _save_to_volume(doc_bytes: bytes, volume_path: str, filename: str) -> str:
+    """Save DOCX bytes to a UC Volume using the Databricks SDK."""
     full_path = f"{volume_path}/{filename}"
     w = WorkspaceClient()
-    w.files.upload(full_path, buffer, overwrite=True)
+    w.files.upload(full_path, io.BytesIO(doc_bytes), overwrite=True)
     return full_path
 
 
 def convert_html_to_docx(filename: str, html_content: str) -> dict:
     """
     Convert HTML content (including Chart.js) to a styled Word document
-    using the corporate template, and save to the configured UC Volume.
+    with native editable charts, and save to the configured UC Volume.
     """
     volume_path = get_volume_path()
     logger.info(f"Target volume path: {volume_path}")
 
     try:
-        # Extract report title for header
         report_title = _extract_report_title(html_content)
-
         soup = BeautifulSoup(html_content, "html.parser")
         has_scripts = bool(soup.find_all("script"))
 
         if has_scripts:
-            logger.info("HTML contains scripts - rendering charts with matplotlib")
+            logger.info("HTML contains scripts - generating native Word charts")
             clean_html, chart_data = _prepare_html_and_charts(html_content)
-            doc = _build_docx_with_charts(clean_html, chart_data, report_title)
+            doc, chart_insertions = _build_docx_with_charts(clean_html, chart_data, report_title)
+
+            # Save doc to bytes, then inject chart parts
+            buf = io.BytesIO()
+            doc.save(buf)
+            doc_bytes = buf.getvalue()
+            doc_bytes = _inject_charts_into_docx(doc_bytes, chart_insertions)
         else:
             logger.info("HTML is static - converting directly with template")
             body = soup.find("body")
             clean_html = str(body) if body else html_content
             doc = _load_template()
-            # Replace header
             date_str = datetime.now().strftime("%B %Y")
             _replace_header_placeholders(doc, report_title, date_str)
-            parser = HtmlToDocx()
-            parser.add_html_to_document(clean_html, doc)
+            parser_obj = HtmlToDocx()
+            parser_obj.add_html_to_document(clean_html, doc)
             _insert_table_of_contents(doc)
             _apply_corporate_styling(doc)
+            buf = io.BytesIO()
+            doc.save(buf)
+            doc_bytes = buf.getvalue()
 
     except Exception as e:
         logger.error(f"HTML to DOCX conversion failed: {e}")
         raise ValueError(f"HTML to DOCX conversion failed: {e}") from e
 
     try:
-        full_path = _save_to_volume(doc, volume_path, filename)
+        full_path = _save_to_volume(doc_bytes, volume_path, filename)
         logger.info(f"DOCX report saved successfully: {full_path}")
     except Exception as e:
         logger.error(f"Failed to write report to volume: {e}")
