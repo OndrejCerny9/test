@@ -347,6 +347,104 @@ def _extract_report_title(html_content: str) -> str:
     return "Sector Report"
 
 
+
+
+def _insert_table_of_contents(doc: Document):
+    """
+    Insert a Table of Contents page after the first heading (title).
+    Adds 'Obsah' heading, a TOC field code, and a page break.
+    Word will auto-populate the TOC entries when the document is opened/updated.
+    """
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn as _qn
+    
+    # Find the first Heading 1 paragraph (the title)
+    insert_after_idx = None
+    for i, para in enumerate(doc.paragraphs):
+        if para.style and 'Heading 1' in para.style.name:
+            insert_after_idx = i
+            break
+    
+    if insert_after_idx is None:
+        insert_after_idx = 0
+    
+    # We'll insert after the title paragraph
+    # Get the element to insert after
+    title_element = doc.paragraphs[insert_after_idx]._element
+    
+    # Create "Obsah" heading paragraph
+    obsah_p = OxmlElement('w:p')
+    obsah_pPr = OxmlElement('w:pPr')
+    obsah_pStyle = OxmlElement('w:pStyle')
+    obsah_pStyle.set(_qn('w:val'), 'Heading1')
+    obsah_pPr.append(obsah_pStyle)
+    obsah_p.append(obsah_pPr)
+    obsah_r = OxmlElement('w:r')
+    obsah_t = OxmlElement('w:t')
+    obsah_t.text = 'Obsah'
+    obsah_r.append(obsah_t)
+    obsah_p.append(obsah_r)
+    
+    # Create TOC field paragraph
+    toc_p = OxmlElement('w:p')
+    
+    # Field begin
+    r_begin = OxmlElement('w:r')
+    fldChar_begin = OxmlElement('w:fldChar')
+    fldChar_begin.set(_qn('w:fldCharType'), 'begin')
+    r_begin.append(fldChar_begin)
+    toc_p.append(r_begin)
+    
+    # Field instruction
+    r_instr = OxmlElement('w:r')
+    instrText = OxmlElement('w:instrText')
+    instrText.set(_qn('xml:space'), 'preserve')
+    instrText.text = ' TOC \\o "1-3" \\h \\z \\u '
+    r_instr.append(instrText)
+    toc_p.append(r_instr)
+    
+    # Field separate
+    r_sep = OxmlElement('w:r')
+    fldChar_sep = OxmlElement('w:fldChar')
+    fldChar_sep.set(_qn('w:fldCharType'), 'separate')
+    r_sep.append(fldChar_sep)
+    toc_p.append(r_sep)
+    
+    # Placeholder text (shown before Word updates the field)
+    r_placeholder = OxmlElement('w:r')
+    rPr_placeholder = OxmlElement('w:rPr')
+    rFonts_ph = OxmlElement('w:rFonts')
+    rFonts_ph.set(_qn('w:ascii'), 'Franklin Gothic Book')
+    rFonts_ph.set(_qn('w:hAnsi'), 'Franklin Gothic Book')
+    rPr_placeholder.append(rFonts_ph)
+    r_placeholder.append(rPr_placeholder)
+    t_placeholder = OxmlElement('w:t')
+    t_placeholder.text = 'Aktualizujte obsah kliknutím pravým tlačítkem a výběrem "Aktualizovat pole"'
+    r_placeholder.append(t_placeholder)
+    toc_p.append(r_placeholder)
+    
+    # Field end
+    r_end = OxmlElement('w:r')
+    fldChar_end = OxmlElement('w:fldChar')
+    fldChar_end.set(_qn('w:fldCharType'), 'end')
+    r_end.append(fldChar_end)
+    toc_p.append(r_end)
+    
+    # Page break paragraph
+    pagebreak_p = OxmlElement('w:p')
+    pb_r = OxmlElement('w:r')
+    pb_br = OxmlElement('w:br')
+    pb_br.set(_qn('w:type'), 'page')
+    pb_r.append(pb_br)
+    pagebreak_p.append(pb_r)
+    
+    # Insert in reverse order (after title): page break, TOC field, Obsah heading
+    title_element.addnext(pagebreak_p)
+    title_element.addnext(toc_p)
+    title_element.addnext(obsah_p)
+    
+    logger.info("Inserted Table of Contents (Obsah) after title")
+
 def _apply_corporate_styling(doc: Document):
     """
     Post-process the document to apply corporate fonts and styling.
@@ -407,6 +505,9 @@ def _build_docx_with_charts(html_content: str, chart_data: dict, report_title: s
     # Convert HTML to DOCX content
     parser = HtmlToDocx()
     parser.add_html_to_document(html_content, doc)
+
+    # Insert Table of Contents after the title
+    _insert_table_of_contents(doc)
 
     # Find and replace placeholder paragraphs with charts
     for canvas_id, data in chart_data.items():
@@ -517,6 +618,7 @@ def convert_html_to_docx(filename: str, html_content: str) -> dict:
             _replace_header_placeholders(doc, report_title, date_str)
             parser = HtmlToDocx()
             parser.add_html_to_document(clean_html, doc)
+            _insert_table_of_contents(doc)
             _apply_corporate_styling(doc)
 
     except Exception as e:
