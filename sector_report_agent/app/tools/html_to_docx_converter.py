@@ -5,20 +5,24 @@ Converts HTML report content (including Chart.js configurations) to a Word
 document (.docx) and saves it to a Unity Catalog Volume.
 
 Strategy:
-- Split HTML at chart positions into text segments and chart segments
-- Convert text segments with htmldocx
-- Render chart segments with matplotlib and insert as images via python-docx
+- Load corporate DOCX template (with styles, header/footer, page setup)
+- Extract Chart.js configs via regex (supports both direct and variable patterns)
+- Render charts with matplotlib using corporate color palette
+- Convert HTML text/tables with htmldocx
+- Insert chart images with captions and source citations
+- Replace header placeholders with actual report title/date
 - Save to UC Volume via Databricks SDK
 """
 
 import os
 import io
 import re
-import base64
 import logging
-from bs4 import BeautifulSoup, NavigableString
+from datetime import datetime
+from bs4 import BeautifulSoup
 from docx import Document
-from docx.shared import Inches
+from docx.shared import Inches, Pt, RGBColor, Cm
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from htmldocx import HtmlToDocx
 from databricks.sdk import WorkspaceClient
 import matplotlib
@@ -32,11 +36,27 @@ DEFAULT_VOLUME_PATH = "/Volumes/agentbricks/volumes/agent_reports"
 
 CHART_PLACEHOLDER = "___CHART_PLACEHOLDER_{}___ "
 
+# Corporate color palette (from reference document)
+CORPORATE_COLORS = [
+    '#4E5B6F',  # Dark blue-gray (primary)
+    '#007EEA',  # Bright blue
+    '#898989',  # Medium gray
+    '#D6ECFF',  # Light blue
+    '#A7D6FF',  # Sky blue
+    '#FFDF43',  # Yellow accent
+    '#8E9BB0',  # Steel blue
+    '#245375',  # Dark teal (heading color)
+    '#4CAF50',  # Green
+    '#FF6B6B',  # Red accent
+]
+
+# Template path (relative to the app directory)
+TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "template.docx")
+
 
 def get_volume_path() -> str:
     """Get the configured volume path from environment or use default."""
     return os.environ.get("REPORT_VOLUME_PATH", DEFAULT_VOLUME_PATH)
-
 
 
 def _find_chart_config_end(text: str) -> int:
@@ -69,21 +89,18 @@ def _extract_chart_configs(html_content: str) -> list:
     """
     charts = []
 
-    # First, build a map of variable names to canvas IDs
-    # Matches: const/let/var name = document.getElementById('id') or .getContext('2d')
-    var_pattern = r'''(?:const|let|var)\s+(\w+)\s*=\s*document\.getElementById\s*\(\s*['"]([^'"]+)['"]\s*\)'''
+    # Build a map of variable names to canvas IDs
+    var_pattern = r"""(?:const|let|var)\s+(\w+)\s*=\s*document\.getElementById\s*\(\s*['"]([^'"]+)['"]\s*\)"""
     var_to_canvas = {}
     for var_match in re.finditer(var_pattern, html_content):
-        var_name = var_match.group(1)
-        canvas_id = var_match.group(2)
-        var_to_canvas[var_name] = canvas_id
+        var_to_canvas[var_match.group(1)] = var_match.group(2)
 
-    # Pattern 1: new Chart(document.getElementById('id'), {...})
+    # Pattern 1: direct
     pattern1 = r'new\s+Chart\s*\(\s*document\.getElementById\s*\(\s*[\x27"]([^\x27"]+)[\x27"]\s*\)'
-    # Pattern 2: new Chart(variableName, {...})
+    # Pattern 2: variable
     pattern2 = r'new\s+Chart\s*\(\s*(\w+)\s*,'
 
-    found_charts = []  # list of (canvas_id, rest_of_content)
+    found_charts = []
 
     for match in re.finditer(pattern1, html_content):
         canvas_id = match.group(1)
@@ -92,21 +109,18 @@ def _extract_chart_configs(html_content: str) -> list:
 
     for match in re.finditer(pattern2, html_content):
         var_name = match.group(1)
-        # Skip if var_name is 'document' (would be caught by pattern1)
         if var_name == 'document':
             continue
         if var_name in var_to_canvas:
             canvas_id = var_to_canvas[var_name]
-            # Check we haven't already found this canvas from pattern1
             if not any(c[0] == canvas_id for c in found_charts):
                 rest = html_content[match.end():]
                 found_charts.append((canvas_id, rest))
 
     for canvas_id, rest in found_charts:
-        # Scope rest to only this chart's config (not subsequent charts)
+        # Scope rest to only this chart's config
         config_end = _find_chart_config_end(rest)
         rest = rest[:config_end]
-
 
         # Extract chart type
         type_match = re.search(r'type\s*:\s*[\x27"]([^\x27"]+)[\x27"]', rest[:1000])
@@ -119,12 +133,12 @@ def _extract_chart_configs(html_content: str) -> list:
             labels = [l.strip().strip("\x27\"") for l in labels_match.group(1).split(",")]
 
         # Extract datasets
-        datasets = []
         data_arrays = re.findall(r'data\s*:\s*\[([\d.,\s\-]+)\]', rest[:10000])
         ds_labels = re.findall(r'label\s*:\s*[\x27"]([^\x27"]+)[\x27"]', rest[:10000])
         bg_colors = re.findall(r'backgroundColor\s*:\s*[\x27"]([^\x27"]+)[\x27"]', rest[:10000])
         border_colors = re.findall(r'borderColor\s*:\s*[\x27"]([^\x27"]+)[\x27"]', rest[:10000])
 
+        datasets = []
         for i, data_str in enumerate(data_arrays):
             try:
                 data_vals = [float(x.strip()) for x in data_str.split(",") if x.strip()]
@@ -161,7 +175,7 @@ def _extract_chart_configs(html_content: str) -> list:
 def _parse_color(color_str) -> tuple:
     """Parse rgba/rgb/hex color string to matplotlib-compatible format."""
     if not isinstance(color_str, str):
-        return '#667eea'
+        return CORPORATE_COLORS[0]
     color_str = color_str.strip()
     rgba_match = re.match(r'rgba?\(([\d.]+),\s*([\d.]+),\s*([\d.]+)(?:,\s*([\d.]+))?\)', color_str)
     if rgba_match:
@@ -172,22 +186,26 @@ def _parse_color(color_str) -> tuple:
         return (r/255, g/255, b/255, a)
     if color_str.startswith('#'):
         return color_str
-    return '#667eea'
+    return CORPORATE_COLORS[0]
 
 
 def _render_chart_to_png_bytes(config: dict) -> bytes:
-    """Render a chart config to PNG bytes using matplotlib."""
+    """Render a chart config to PNG bytes using matplotlib with corporate styling."""
     chart_type = config.get("type", "bar")
     labels = config.get("labels", [])
     datasets = config.get("datasets", [])
     title = config.get("title")
 
-    default_colors = [
-        '#667eea', '#764ba2', '#f093fb', '#f5576c', '#4facfe',
-        '#00f2fe', '#43e97b', '#fa709a', '#fee140', '#a18cd1'
-    ]
+    # Use corporate style
+    plt.rcParams.update({
+        'font.family': 'sans-serif',
+        'font.sans-serif': ['Franklin Gothic Book', 'Arial', 'DejaVu Sans'],
+        'font.size': 10,
+        'axes.titlesize': 12,
+        'axes.labelsize': 10,
+    })
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(10, 4.5))
 
     if chart_type == "bar":
         x = np.arange(len(labels))
@@ -195,45 +213,47 @@ def _render_chart_to_png_bytes(config: dict) -> bytes:
         width = 0.8 / n_datasets
         for i, ds in enumerate(datasets):
             offset = (i - n_datasets / 2 + 0.5) * width
-            color = _parse_color(ds.get("backgroundColor", default_colors[i % len(default_colors)]))
+            color = _parse_color(ds.get("backgroundColor", CORPORATE_COLORS[i % len(CORPORATE_COLORS)]))
             ax.bar(x + offset, ds.get("data", []), width,
                    label=ds.get("label", ""), color=color)
         ax.set_xticks(x)
-        ax.set_xticklabels(labels, fontsize=11, fontweight='bold')
+        ax.set_xticklabels(labels, fontsize=9)
 
     elif chart_type == "line":
         for i, ds in enumerate(datasets):
-            color = _parse_color(ds.get("backgroundColor", default_colors[i % len(default_colors)]))
+            color = _parse_color(ds.get("backgroundColor", CORPORATE_COLORS[i % len(CORPORATE_COLORS)]))
             ax.plot(labels, ds.get("data", []), marker='o', linewidth=2.5,
-                    label=ds.get("label", ""), color=color, markersize=6)
+                    label=ds.get("label", ""), color=color, markersize=5)
 
     elif chart_type in ("pie", "doughnut"):
         if datasets:
             ds = datasets[0]
-            colors = [_parse_color(default_colors[i % len(default_colors)]) for i in range(len(labels))]
+            colors = [_parse_color(CORPORATE_COLORS[i % len(CORPORATE_COLORS)]) for i in range(len(labels))]
             wedgeprops = {"width": 0.4} if chart_type == "doughnut" else {}
             ax.pie(ds.get("data", []), labels=labels, colors=colors,
-                   autopct='%1.1f%%', wedgeprops=wedgeprops)
+                   autopct='%1.1f%%', wedgeprops=wedgeprops,
+                   textprops={'fontsize': 9})
             ax.set_aspect('equal')
     else:
+        # Fallback to bar
         x = np.arange(len(labels))
         if datasets:
-            color = _parse_color(datasets[0].get("backgroundColor", default_colors[0]))
+            color = _parse_color(datasets[0].get("backgroundColor", CORPORATE_COLORS[0]))
             ax.bar(x, datasets[0].get("data", []), color=color,
                    label=datasets[0].get("label", ""))
             ax.set_xticks(x)
-            ax.set_xticklabels(labels, fontsize=11)
+            ax.set_xticklabels(labels, fontsize=9)
 
     if title:
-        ax.set_title(title, fontsize=14, fontweight='bold', pad=15)
+        ax.set_title(title, fontsize=12, fontweight='bold', pad=12, color='#245375')
 
     if chart_type not in ("pie", "doughnut"):
         if any(ds.get("label") for ds in datasets):
-            ax.legend(loc='upper left', fontsize=10)
+            ax.legend(loc='upper left', fontsize=9, framealpha=0.9)
 
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
-    ax.grid(axis='y', alpha=0.3)
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
     plt.tight_layout()
 
     buffer = io.BytesIO()
@@ -248,10 +268,10 @@ def _prepare_html_and_charts(html_content: str) -> tuple:
     Process HTML: extract charts, replace canvas elements with placeholders,
     remove scripts/styles, return clean HTML and chart image bytes.
 
-    Returns: (clean_html_str, dict_of_chart_id_to_png_bytes)
+    Returns: (clean_html_str, dict_of_chart_id_to_png_bytes_and_title)
     """
     charts = _extract_chart_configs(html_content)
-    chart_images = {}
+    chart_data = {}
 
     # Render each chart
     for chart_info in charts:
@@ -259,15 +279,18 @@ def _prepare_html_and_charts(html_content: str) -> tuple:
         config = chart_info["config"]
         try:
             png_bytes = _render_chart_to_png_bytes(config)
-            chart_images[canvas_id] = png_bytes
+            chart_data[canvas_id] = {
+                "png_bytes": png_bytes,
+                "title": config.get("title"),
+            }
             logger.info(f"Rendered chart: {canvas_id}")
         except Exception as e:
             logger.warning(f"Failed to render chart {canvas_id}: {e}")
 
-    # Now process the HTML - replace canvas elements with text placeholders
+    # Process the HTML - replace canvas elements with text placeholders
     soup = BeautifulSoup(html_content, "html.parser")
 
-    for canvas_id in chart_images:
+    for canvas_id in chart_data:
         canvas = soup.find("canvas", {"id": canvas_id})
         if canvas:
             placeholder = soup.new_tag("p")
@@ -285,31 +308,121 @@ def _prepare_html_and_charts(html_content: str) -> tuple:
     body = soup.find("body")
     clean_html = str(body) if body else str(soup)
 
-    return clean_html, chart_images
+    return clean_html, chart_data
 
 
-def _build_docx_with_charts(html_content: str, chart_images: dict) -> Document:
+def _load_template() -> Document:
+    """Load the corporate DOCX template."""
+    if os.path.exists(TEMPLATE_PATH):
+        logger.info(f"Loading template from: {TEMPLATE_PATH}")
+        return Document(TEMPLATE_PATH)
+    else:
+        logger.warning(f"Template not found at {TEMPLATE_PATH}, using blank document")
+        return Document()
+
+
+def _replace_header_placeholders(doc: Document, title: str, date_str: str):
+    """Replace {{REPORT_TITLE}} and {{REPORT_DATE}} in the header."""
+    for section in doc.sections:
+        header = section.header
+        for paragraph in header.paragraphs:
+            for run in paragraph.runs:
+                if "{{REPORT_TITLE}}" in run.text:
+                    run.text = run.text.replace("{{REPORT_TITLE}}", title)
+                if "{{REPORT_DATE}}" in run.text:
+                    run.text = run.text.replace("{{REPORT_DATE}}", date_str)
+        footer = section.footer
+        for paragraph in footer.paragraphs:
+            for run in paragraph.runs:
+                if "{{COMPANY_NAME}}" in run.text:
+                    run.text = run.text.replace("{{COMPANY_NAME}}", "")
+
+
+def _extract_report_title(html_content: str) -> str:
+    """Extract the report title from the HTML (first h1 tag)."""
+    soup = BeautifulSoup(html_content, "html.parser")
+    h1 = soup.find("h1")
+    if h1:
+        return h1.get_text(strip=True)
+    return "Sector Report"
+
+
+def _build_docx_with_charts(html_content: str, chart_data: dict, report_title: str) -> Document:
     """
-    Build DOCX: convert HTML with htmldocx, then find placeholder paragraphs
-    and replace them with chart images.
+    Build DOCX using the corporate template: convert HTML with htmldocx,
+    then find placeholder paragraphs and replace them with chart images
+    including title and source caption.
     """
-    doc = Document()
+    doc = _load_template()
+
+    # Replace header placeholders
+    date_str = datetime.now().strftime("%B %Y")
+    _replace_header_placeholders(doc, report_title, date_str)
+
+    # Convert HTML to DOCX content
     parser = HtmlToDocx()
     parser.add_html_to_document(html_content, doc)
 
-    # Now find and replace placeholder paragraphs with images
-    for canvas_id, png_bytes in chart_images.items():
+    # Find and replace placeholder paragraphs with charts
+    for canvas_id, data in chart_data.items():
         placeholder_text = CHART_PLACEHOLDER.format(canvas_id).strip()
+        png_bytes = data["png_bytes"]
+        chart_title = data.get("title")
 
-        for paragraph in doc.paragraphs:
+        for i, paragraph in enumerate(doc.paragraphs):
             if placeholder_text in paragraph.text:
-                # Clear the paragraph text
+                # Clear the placeholder text
                 paragraph.clear()
-                # Add image to this paragraph
+
+                # Add chart title above (using Chart Title style if available)
+                if chart_title:
+                    # Insert title paragraph before the current one
+                    title_para = paragraph.insert_paragraph_before(chart_title)
+                    try:
+                        title_para.style = doc.styles['Chart Title']
+                    except KeyError:
+                        # Fallback: manual formatting
+                        for run in title_para.runs:
+                            run.font.name = 'Times New Roman'
+                            run.font.size = Pt(10)
+                            run.font.bold = True
+
+                # Add the chart image
                 run = paragraph.add_run()
                 image_stream = io.BytesIO(png_bytes)
-                run.add_picture(image_stream, width=Inches(6.0))
-                logger.info(f"Inserted chart image for: {canvas_id}")
+                run.add_picture(image_stream, width=Cm(16.0))
+
+                # Add source citation after the chart using OxmlElement
+                from docx.oxml import OxmlElement
+                from docx.oxml.ns import qn as _qn
+                # Create a new paragraph element after current one
+                new_p_elem = OxmlElement('w:p')
+                # Add run with source text
+                new_r_elem = OxmlElement('w:r')
+                # Run properties (italic, font, size, color)
+                rPr = OxmlElement('w:rPr')
+                rFonts = OxmlElement('w:rFonts')
+                rFonts.set(_qn('w:ascii'), 'Times New Roman')
+                rFonts.set(_qn('w:hAnsi'), 'Times New Roman')
+                rPr.append(rFonts)
+                sz = OxmlElement('w:sz')
+                sz.set(_qn('w:val'), '18')  # 9pt = 18 half-points
+                rPr.append(sz)
+                italic = OxmlElement('w:i')
+                rPr.append(italic)
+                color_elem = OxmlElement('w:color')
+                color_elem.set(_qn('w:val'), '202020')
+                rPr.append(color_elem)
+                new_r_elem.append(rPr)
+                # Text
+                t_elem = OxmlElement('w:t')
+                t_elem.text = "Zdroj: Vlastní zpracování"
+                new_r_elem.append(t_elem)
+                new_p_elem.append(new_r_elem)
+                # Insert after current paragraph
+                paragraph._element.addnext(new_p_elem)
+
+                logger.info(f"Inserted chart with caption: {canvas_id}")
                 break
 
     return doc
@@ -329,25 +442,31 @@ def _save_to_volume(doc: Document, volume_path: str, filename: str) -> str:
 
 def convert_html_to_docx(filename: str, html_content: str) -> dict:
     """
-    Convert HTML content (including Chart.js) to a Word document
-    and save to the configured Unity Catalog Volume.
+    Convert HTML content (including Chart.js) to a styled Word document
+    using the corporate template, and save to the configured UC Volume.
     """
     volume_path = get_volume_path()
     logger.info(f"Target volume path: {volume_path}")
 
     try:
+        # Extract report title for header
+        report_title = _extract_report_title(html_content)
+
         soup = BeautifulSoup(html_content, "html.parser")
         has_scripts = bool(soup.find_all("script"))
 
         if has_scripts:
             logger.info("HTML contains scripts - rendering charts with matplotlib")
-            clean_html, chart_images = _prepare_html_and_charts(html_content)
-            doc = _build_docx_with_charts(clean_html, chart_images)
+            clean_html, chart_data = _prepare_html_and_charts(html_content)
+            doc = _build_docx_with_charts(clean_html, chart_data, report_title)
         else:
-            logger.info("HTML is static - converting directly")
+            logger.info("HTML is static - converting directly with template")
             body = soup.find("body")
             clean_html = str(body) if body else html_content
-            doc = Document()
+            doc = _load_template()
+            # Replace header
+            date_str = datetime.now().strftime("%B %Y")
+            _replace_header_placeholders(doc, report_title, date_str)
             parser = HtmlToDocx()
             parser.add_html_to_document(clean_html, doc)
 
